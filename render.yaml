@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: tgbot-strelyaev
+    runtime: python
+    region: frankfurt
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
