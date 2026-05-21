@@ -36,7 +36,7 @@ url = f"{WEBHOOK_URL}/webhook"
 result = tg("setWebhook", {
     "url": url,
     "secret_token": WEBHOOK_SECRET,
-    "allowed_updates": ["message"],
+    "allowed_updates": ["message", "callback_query"],
     "drop_pending_updates": True,
 })
 print("setWebhook:", result)

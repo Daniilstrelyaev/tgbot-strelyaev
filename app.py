@@ -33,17 +33,65 @@ MAX_SEND_ATTEMPTS = int(os.environ.get("MAX_SEND_ATTEMPTS", "2"))
 SEND_RETRY_AFTER_LIMIT_SECONDS = int(os.environ.get("SEND_RETRY_AFTER_LIMIT_SECONDS", "2"))
 START_RATE_LIMIT_SECONDS = int(os.environ.get("START_RATE_LIMIT_SECONDS", "30"))
 
+CHANNEL_ID_RAW = os.environ.get("CHANNEL_ID", "-1003726576543").strip()
+try:
+    CHANNEL_ID: int | str = int(CHANNEL_ID_RAW)
+except ValueError:
+    CHANNEL_ID = CHANNEL_ID_RAW  # @username form
+CHANNEL_URL = os.environ.get("CHANNEL_URL", "https://t.me/strelyae_v").strip()
+
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is empty")
 if not WEBHOOK_SECRET:
     raise RuntimeError("TELEGRAM_WEBHOOK_SECRET is empty")
 
-START_TEXT = (
+WELCOME_TEXT = (
     "Привет 👋\n\n"
-    "Держи ссылку на канал — там выходит весь контент:\n"
-    "https://t.me/strelyae_v\n\n"
-    "Подписывайся, чтобы не пропустить 🤍"
+    "Меня зовут Даниил — я создаю AI-контент\n"
+    "и обучаю людей делать вирусные видео\n"
+    "через нейросети и зарабатывать на этом.\n\n"
+    "35 млн просмотров на AI-контенте.\n"
+    "8,6 млн на одном ролике.\n"
+    "61 500 подписчиков за 66 дней.\n\n"
+    "Подготовил для тебя материал —\n"
+    "внутри пошаговая система: как создавать\n"
+    "вирусные ролики через нейросети с нуля.\n\n"
+    "Чтобы забрать материал —\n"
+    "подпишись на канал и жми кнопку 👇"
 )
+
+NOT_SUBSCRIBED_TEXT = (
+    "Я не вижу твоей подписки 😔\n\n"
+    "Подпишись на канал и нажми «Готово» —\n"
+    "сразу отправлю обещанный материал."
+)
+
+SUBSCRIBED_TEXT = (
+    "Готово ✅\n\n"
+    "Спасибо, что подписался!\n\n"
+    "Вся польза — в канале.\n"
+    "Контент выходит регулярно, не пропусти 🤍"
+)
+
+WELCOME_KEYBOARD = {
+    "inline_keyboard": [
+        [{"text": "✅ Я подписался", "callback_data": "check_sub"}],
+        [{"text": "📢 Перейти на канал", "url": CHANNEL_URL}],
+    ]
+}
+
+NOT_SUBSCRIBED_KEYBOARD = {
+    "inline_keyboard": [
+        [{"text": "Готово ✅", "callback_data": "check_sub"}],
+        [{"text": "📢 Перейти на канал", "url": CHANNEL_URL}],
+    ]
+}
+
+SUBSCRIBED_KEYBOARD = {
+    "inline_keyboard": [
+        [{"text": "📢 Открыть канал", "url": CHANNEL_URL}],
+    ]
+}
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024
@@ -183,19 +231,36 @@ def _parse_retry_after(response: urllib3.HTTPResponse, parsed: dict[str, Any]) -
     return retry_after
 
 
-def send_message(chat_id: int, text: str) -> SendResult:
-    payload = json.dumps({"chat_id": chat_id, "text": text}, ensure_ascii=False).encode("utf-8")
+def _tg_api_post(method: str, payload: dict[str, Any], read_timeout: float = 3.0) -> tuple[int, dict[str, Any]]:
+    """Single attempt POST to Telegram Bot API. Returns (http_status, parsed_body)."""
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    response = tg_pool.urlopen(
+        "POST",
+        f"/bot{TOKEN}/{method}",
+        body=body,
+        headers={"Content-Type": "application/json"},
+        timeout=urllib3.Timeout(connect=2, read=read_timeout),
+        redirect=False,
+    )
+    body_text = response.data.decode("utf-8", errors="replace")
+    parsed: dict[str, Any] = {}
+    try:
+        candidate = json.loads(body_text)
+        if isinstance(candidate, dict):
+            parsed = candidate
+    except json.JSONDecodeError:
+        parsed = {}
+    return response.status, parsed
+
+
+def send_message(chat_id: int, text: str, reply_markup: dict[str, Any] | None = None) -> SendResult:
+    payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
 
     for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
         try:
-            response = tg_pool.urlopen(
-                "POST",
-                f"/bot{TOKEN}/sendMessage",
-                body=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=urllib3.Timeout(connect=2, read=3),
-                redirect=False,
-            )
+            status, parsed = _tg_api_post("sendMessage", payload)
         except urllib3.exceptions.ReadTimeoutError as exc:
             log.warning("sendMessage ambiguous read timeout: %s", _redact_secret(str(exc)))
             return SendResult.RETRYABLE_FAILURE
@@ -212,16 +277,6 @@ def send_message(chat_id: int, text: str) -> SendResult:
             time.sleep(0.3 * attempt)
             continue
 
-        status = response.status
-        body_text = response.data.decode("utf-8", errors="replace")
-        parsed: dict[str, Any] = {}
-        try:
-            candidate = json.loads(body_text)
-            if isinstance(candidate, dict):
-                parsed = candidate
-        except json.JSONDecodeError:
-            parsed = {}
-
         if parsed.get("ok") is True:
             return SendResult.OK
 
@@ -229,12 +284,19 @@ def send_message(chat_id: int, text: str) -> SendResult:
         description = parsed.get("description")
 
         if status == 429 or err_code == 429:
-            retry_after = _parse_retry_after(response, parsed)
+            # Need raw response for Retry-After; recompute with a fresh call would be wasteful.
+            # Fallback to parameters.retry_after only.
+            retry_after = 1
+            parameters = parsed.get("parameters")
+            if isinstance(parameters, dict):
+                maybe_retry = parameters.get("retry_after")
+                if isinstance(maybe_retry, int):
+                    retry_after = max(1, maybe_retry)
             if retry_after <= SEND_RETRY_AFTER_LIMIT_SECONDS and attempt < MAX_SEND_ATTEMPTS:
                 log.warning("sendMessage rate-limited attempt=%s retry_after=%ss", attempt, retry_after)
                 time.sleep(retry_after)
                 continue
-            log.warning("sendMessage rate-limited; deferring to Telegram retry retry_after=%ss", retry_after)
+            log.warning("sendMessage rate-limited; deferring to Telegram retry_after=%ss", retry_after)
             return SendResult.RETRYABLE_FAILURE
 
         if 500 <= status < 600:
@@ -253,18 +315,46 @@ def send_message(chat_id: int, text: str) -> SendResult:
             return SendResult.RETRYABLE_FAILURE
 
         if status >= 400:
-            log.warning(
-                "sendMessage HTTP error status=%s error_code=%s description=%s",
-                status,
-                err_code,
-                description,
-            )
+            log.warning("sendMessage HTTP error status=%s error_code=%s description=%s", status, err_code, description)
             return SendResult.RETRYABLE_FAILURE
 
-        log.warning("sendMessage unexpected body status=%s body=%s", status, body_text[:500])
+        log.warning("sendMessage unexpected body status=%s", status)
         return SendResult.RETRYABLE_FAILURE
 
     return SendResult.RETRYABLE_FAILURE
+
+
+def answer_callback_query(callback_id: str, text: str = "", show_alert: bool = False) -> bool:
+    payload: dict[str, Any] = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text
+        payload["show_alert"] = show_alert
+    try:
+        _, parsed = _tg_api_post("answerCallbackQuery", payload, read_timeout=3.0)
+        return parsed.get("ok") is True
+    except Exception as exc:
+        log.warning("answerCallbackQuery error: %s", _redact_secret(str(exc)))
+        return False
+
+
+def check_subscription(user_id: int) -> bool | None:
+    """Returns True if subscribed, False if not, None on API error."""
+    payload = {"chat_id": CHANNEL_ID, "user_id": user_id}
+    try:
+        _, parsed = _tg_api_post("getChatMember", payload, read_timeout=4.0)
+    except Exception as exc:
+        log.warning("getChatMember error: %s", _redact_secret(str(exc)))
+        return None
+
+    if not parsed.get("ok"):
+        log.warning("getChatMember failed: %s", parsed.get("description"))
+        return None
+
+    result = parsed.get("result")
+    if not isinstance(result, dict):
+        return None
+    status = result.get("status")
+    return status in ("member", "administrator", "creator", "restricted")
 
 
 def _build_keepalive_target(service_url: str) -> tuple[Any | None, str, str]:
@@ -282,11 +372,8 @@ def _build_keepalive_target(service_url: str) -> tuple[Any | None, str, str]:
     retries = urllib3.Retry(connect=1, read=0, status=0, redirect=0, backoff_factor=0.3)
     if scheme == "https":
         pool = urllib3.HTTPSConnectionPool(
-            host,
-            port=port,
-            maxsize=1,
-            cert_reqs="CERT_REQUIRED",
-            ca_certs=certifi.where(),
+            host, port=port, maxsize=1,
+            cert_reqs="CERT_REQUIRED", ca_certs=certifi.where(),
             retries=retries,
         )
     else:
@@ -323,8 +410,7 @@ def _keepalive() -> None:
 
         try:
             response = pool.urlopen(
-                "GET",
-                health_path,
+                "GET", health_path,
                 timeout=urllib3.Timeout(connect=5, read=10),
                 headers={"User-Agent": "render-keepalive/1.0"},
                 redirect=False,
@@ -352,6 +438,149 @@ def _shutdown_background_threads() -> None:
     stop_event.set()
 
 
+def _handle_message(update: dict[str, Any], claimed_update_id: int | None) -> tuple[str, int, bool]:
+    """Returns (body, status, update_finalized)."""
+    message = update.get("message")
+    if not isinstance(message, dict):
+        if claimed_update_id is not None:
+            _commit_update(claimed_update_id)
+        return "ok", 200, True
+
+    text = message.get("text")
+    chat = message.get("chat")
+    if not isinstance(text, str) or not isinstance(chat, dict):
+        if claimed_update_id is not None:
+            _commit_update(claimed_update_id)
+        return "ok", 200, True
+
+    if not _is_start_command(text):
+        if claimed_update_id is not None:
+            _commit_update(claimed_update_id)
+        return "ok", 200, True
+
+    chat_id = chat.get("id")
+    if not isinstance(chat_id, int) or isinstance(chat_id, bool):
+        if claimed_update_id is not None:
+            _commit_update(claimed_update_id)
+        return "ok", 200, True
+
+    username = "-"
+    from_user = message.get("from")
+    if isinstance(from_user, dict):
+        maybe_username = from_user.get("username")
+        if isinstance(maybe_username, str) and maybe_username:
+            username = maybe_username
+
+    if not _claim_chat_send(chat_id):
+        log.info("/start @%s (%s) -> throttled", username, chat_id)
+        if claimed_update_id is not None:
+            _commit_update(claimed_update_id)
+        return "ok", 200, True
+
+    chat_send_finalized = False
+    try:
+        started_at = time.monotonic()
+        result = send_message(chat_id, WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD)
+        elapsed_ms = (time.monotonic() - started_at) * 1000
+        log.info("/start @%s (%s) -> %s %.0fms", username, chat_id, result.value, elapsed_ms)
+
+        if result is SendResult.RETRYABLE_FAILURE:
+            _release_chat_send(chat_id)
+            chat_send_finalized = True
+            if claimed_update_id is not None:
+                _release_update(claimed_update_id)
+            return "retry", 503, True
+
+        _commit_chat_send(chat_id)
+        chat_send_finalized = True
+        if claimed_update_id is not None:
+            _commit_update(claimed_update_id)
+        return "ok", 200, True
+    finally:
+        if not chat_send_finalized:
+            _release_chat_send(chat_id)
+
+
+def _handle_callback_query(callback: dict[str, Any], claimed_update_id: int | None) -> tuple[str, int, bool]:
+    callback_id = callback.get("id")
+    data = callback.get("data")
+    if not isinstance(callback_id, str) or not isinstance(data, str):
+        if claimed_update_id is not None:
+            _commit_update(claimed_update_id)
+        return "ok", 200, True
+
+    from_user = callback.get("from")
+    if not isinstance(from_user, dict):
+        if claimed_update_id is not None:
+            _commit_update(claimed_update_id)
+        return "ok", 200, True
+
+    user_id = from_user.get("id")
+    if not isinstance(user_id, int) or isinstance(user_id, bool):
+        if claimed_update_id is not None:
+            _commit_update(claimed_update_id)
+        return "ok", 200, True
+
+    username = from_user.get("username") if isinstance(from_user.get("username"), str) else "-"
+
+    message = callback.get("message")
+    chat_id: int | None = None
+    if isinstance(message, dict):
+        chat = message.get("chat")
+        if isinstance(chat, dict):
+            maybe_chat_id = chat.get("id")
+            if isinstance(maybe_chat_id, int) and not isinstance(maybe_chat_id, bool):
+                chat_id = maybe_chat_id
+
+    if chat_id is None:
+        answer_callback_query(callback_id)
+        if claimed_update_id is not None:
+            _commit_update(claimed_update_id)
+        return "ok", 200, True
+
+    if data == "check_sub":
+        started_at = time.monotonic()
+        subscribed = check_subscription(user_id)
+        check_ms = (time.monotonic() - started_at) * 1000
+
+        if subscribed is None:
+            answer_callback_query(callback_id, "Произошла ошибка, попробуй ещё раз", show_alert=True)
+            log.warning("check_sub @%s (%s) -> API error %.0fms", username, user_id, check_ms)
+            if claimed_update_id is not None:
+                _release_update(claimed_update_id)
+            return "retry", 503, True
+
+        if subscribed:
+            answer_callback_query(callback_id, "Подписка подтверждена ✅")
+            result = send_message(chat_id, SUBSCRIBED_TEXT, reply_markup=SUBSCRIBED_KEYBOARD)
+            log.info("check_sub @%s (%s) -> SUBSCRIBED send=%s %.0fms",
+                     username, user_id, result.value, check_ms)
+            if result is SendResult.RETRYABLE_FAILURE:
+                if claimed_update_id is not None:
+                    _release_update(claimed_update_id)
+                return "retry", 503, True
+        else:
+            answer_callback_query(callback_id, "Не вижу подписки 😔", show_alert=False)
+            result = send_message(chat_id, NOT_SUBSCRIBED_TEXT, reply_markup=NOT_SUBSCRIBED_KEYBOARD)
+            log.info("check_sub @%s (%s) -> NOT SUBSCRIBED send=%s %.0fms",
+                     username, user_id, result.value, check_ms)
+            if result is SendResult.RETRYABLE_FAILURE:
+                if claimed_update_id is not None:
+                    _release_update(claimed_update_id)
+                return "retry", 503, True
+
+        if claimed_update_id is not None:
+            _commit_update(claimed_update_id)
+        return "ok", 200, True
+
+    # Unknown callback data — just ack
+    answer_callback_query(callback_id)
+    log.info("unknown callback data=%r from @%s (%s)", data, username, user_id)
+    if claimed_update_id is not None:
+        _commit_update(claimed_update_id)
+    return "ok", 200, True
+
+
 @app.post("/webhook")
 def webhook() -> tuple[str, int]:
     secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
@@ -369,80 +598,21 @@ def webhook() -> tuple[str, int]:
     has_update_id = isinstance(update_id_value, int) and not isinstance(update_id_value, bool)
     update_id = update_id_value if has_update_id else None
     claimed_update_id: int | None = None
-    update_finalized = False
 
     if update_id is not None:
         if not _claim_update(update_id):
             return "ok", 200
         claimed_update_id = update_id
 
+    update_finalized = False
     try:
-        message = update.get("message")
-        if not isinstance(message, dict):
-            if claimed_update_id is not None:
-                _commit_update(claimed_update_id)
-                update_finalized = True
-            return "ok", 200
+        callback = update.get("callback_query")
+        if isinstance(callback, dict):
+            body, status, update_finalized = _handle_callback_query(callback, claimed_update_id)
+            return body, status
 
-        text = message.get("text")
-        chat = message.get("chat")
-        if not isinstance(text, str) or not isinstance(chat, dict):
-            if claimed_update_id is not None:
-                _commit_update(claimed_update_id)
-                update_finalized = True
-            return "ok", 200
-        if not _is_start_command(text):
-            if claimed_update_id is not None:
-                _commit_update(claimed_update_id)
-                update_finalized = True
-            return "ok", 200
-
-        chat_id = chat.get("id")
-        if not isinstance(chat_id, int) or isinstance(chat_id, bool):
-            if claimed_update_id is not None:
-                _commit_update(claimed_update_id)
-                update_finalized = True
-            return "ok", 200
-
-        username = "-"
-        from_user = message.get("from")
-        if isinstance(from_user, dict):
-            maybe_username = from_user.get("username")
-            if isinstance(maybe_username, str) and maybe_username:
-                username = maybe_username
-
-        claimed_chat_send = _claim_chat_send(chat_id)
-        chat_send_finalized = False
-        if not claimed_chat_send:
-            log.info("/start @%s (%s) -> throttled", username, chat_id)
-            if claimed_update_id is not None:
-                _commit_update(claimed_update_id)
-                update_finalized = True
-            return "ok", 200
-
-        try:
-            started_at = time.monotonic()
-            result = send_message(chat_id, START_TEXT)
-            elapsed_ms = (time.monotonic() - started_at) * 1000
-            log.info("/start @%s (%s) -> %s %.0fms", username, chat_id, result.value, elapsed_ms)
-
-            if result is SendResult.RETRYABLE_FAILURE:
-                _release_chat_send(chat_id)
-                chat_send_finalized = True
-                if claimed_update_id is not None:
-                    _release_update(claimed_update_id)
-                    update_finalized = True
-                return "retry", 503
-
-            _commit_chat_send(chat_id)
-            chat_send_finalized = True
-            if claimed_update_id is not None:
-                _commit_update(claimed_update_id)
-                update_finalized = True
-            return "ok", 200
-        finally:
-            if not chat_send_finalized:
-                _release_chat_send(chat_id)
+        body, status, update_finalized = _handle_message(update, claimed_update_id)
+        return body, status
     finally:
         if claimed_update_id is not None and not update_finalized:
             _release_update(claimed_update_id)
@@ -455,6 +625,7 @@ def health() -> tuple[dict[str, Any], int]:
         "inflight_updates": len(_inflight_update_ids),
         "seen_updates": len(_seen_update_ids),
         "keepalive_enabled": KEEPALIVE_ENABLED,
+        "channel_id": CHANNEL_ID,
     }, 200
 
 
