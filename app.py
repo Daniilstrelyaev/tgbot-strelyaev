@@ -39,6 +39,7 @@ try:
 except ValueError:
     CHANNEL_ID = CHANNEL_ID_RAW  # @username form
 CHANNEL_URL = os.environ.get("CHANNEL_URL", "https://t.me/strelyae_v").strip()
+WELCOME_PHOTO_FILE_ID = os.environ.get("WELCOME_PHOTO_FILE_ID", "").strip()
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is empty")
@@ -253,25 +254,22 @@ def _tg_api_post(method: str, payload: dict[str, Any], read_timeout: float = 3.0
     return response.status, parsed
 
 
-def send_message(chat_id: int, text: str, reply_markup: dict[str, Any] | None = None) -> SendResult:
-    payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-
+def _send_with_retries(api_method: str, payload: dict[str, Any], log_label: str) -> SendResult:
+    """Common retry loop for sendMessage / sendPhoto / etc."""
     for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
         try:
-            status, parsed = _tg_api_post("sendMessage", payload)
+            status, parsed = _tg_api_post(api_method, payload)
         except urllib3.exceptions.ReadTimeoutError as exc:
-            log.warning("sendMessage ambiguous read timeout: %s", _redact_secret(str(exc)))
+            log.warning("%s ambiguous read timeout: %s", log_label, _redact_secret(str(exc)))
             return SendResult.RETRYABLE_FAILURE
         except urllib3.exceptions.HTTPError as exc:
-            log.warning("sendMessage transport error attempt=%s: %s", attempt, _redact_secret(str(exc)))
+            log.warning("%s transport error attempt=%s: %s", log_label, attempt, _redact_secret(str(exc)))
             if attempt == MAX_SEND_ATTEMPTS:
                 return SendResult.RETRYABLE_FAILURE
             time.sleep(0.3 * attempt)
             continue
         except Exception as exc:
-            log.warning("sendMessage unexpected error attempt=%s: %s", attempt, _redact_secret(str(exc)))
+            log.warning("%s unexpected error attempt=%s: %s", log_label, attempt, _redact_secret(str(exc)))
             if attempt == MAX_SEND_ATTEMPTS:
                 return SendResult.RETRYABLE_FAILURE
             time.sleep(0.3 * attempt)
@@ -284,8 +282,6 @@ def send_message(chat_id: int, text: str, reply_markup: dict[str, Any] | None = 
         description = parsed.get("description")
 
         if status == 429 or err_code == 429:
-            # Need raw response for Retry-After; recompute with a fresh call would be wasteful.
-            # Fallback to parameters.retry_after only.
             retry_after = 1
             parameters = parsed.get("parameters")
             if isinstance(parameters, dict):
@@ -293,35 +289,65 @@ def send_message(chat_id: int, text: str, reply_markup: dict[str, Any] | None = 
                 if isinstance(maybe_retry, int):
                     retry_after = max(1, maybe_retry)
             if retry_after <= SEND_RETRY_AFTER_LIMIT_SECONDS and attempt < MAX_SEND_ATTEMPTS:
-                log.warning("sendMessage rate-limited attempt=%s retry_after=%ss", attempt, retry_after)
+                log.warning("%s rate-limited attempt=%s retry_after=%ss", log_label, attempt, retry_after)
                 time.sleep(retry_after)
                 continue
-            log.warning("sendMessage rate-limited; deferring to Telegram retry_after=%ss", retry_after)
+            log.warning("%s rate-limited; deferring to Telegram retry_after=%ss", log_label, retry_after)
             return SendResult.RETRYABLE_FAILURE
 
         if 500 <= status < 600:
-            log.warning("sendMessage upstream 5xx status=%s attempt=%s", status, attempt)
+            log.warning("%s upstream 5xx status=%s attempt=%s", log_label, status, attempt)
             if attempt == MAX_SEND_ATTEMPTS:
                 return SendResult.RETRYABLE_FAILURE
             time.sleep(0.5 * attempt)
             continue
 
         if err_code in (400, 403):
-            log.info("sendMessage permanent reject error_code=%s description=%s", err_code, description)
+            log.info("%s permanent reject error_code=%s description=%s", log_label, err_code, description)
             return SendResult.PERMANENT_FAILURE
 
         if status in (401, 404):
-            log.error("sendMessage token/config error status=%s description=%s", status, description)
+            log.error("%s token/config error status=%s description=%s", log_label, status, description)
             return SendResult.RETRYABLE_FAILURE
 
         if status >= 400:
-            log.warning("sendMessage HTTP error status=%s error_code=%s description=%s", status, err_code, description)
+            log.warning("%s HTTP error status=%s error_code=%s description=%s", log_label, status, err_code, description)
             return SendResult.RETRYABLE_FAILURE
 
-        log.warning("sendMessage unexpected body status=%s", status)
+        log.warning("%s unexpected body status=%s", log_label, status)
         return SendResult.RETRYABLE_FAILURE
 
     return SendResult.RETRYABLE_FAILURE
+
+
+def send_message(chat_id: int, text: str, reply_markup: dict[str, Any] | None = None) -> SendResult:
+    payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return _send_with_retries("sendMessage", payload, "sendMessage")
+
+
+def send_photo(chat_id: int, photo: str, caption: str | None = None,
+               reply_markup: dict[str, Any] | None = None) -> SendResult:
+    payload: dict[str, Any] = {"chat_id": chat_id, "photo": photo}
+    if caption:
+        payload["caption"] = caption
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return _send_with_retries("sendPhoto", payload, "sendPhoto")
+
+
+def send_welcome(chat_id: int) -> SendResult:
+    """Send welcome message with photo (if configured) or fall back to text-only."""
+    if WELCOME_PHOTO_FILE_ID:
+        result = send_photo(chat_id, WELCOME_PHOTO_FILE_ID,
+                            caption=WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD)
+        # If photo failed permanently (e.g. invalid file_id), fall back to text
+        if result is SendResult.PERMANENT_FAILURE:
+            log.warning("sendPhoto failed permanently, falling back to text-only welcome")
+            return send_message(chat_id, WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD)
+        return result
+    return send_message(chat_id, WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD)
 
 
 def answer_callback_query(callback_id: str, text: str = "", show_alert: bool = False) -> bool:
@@ -480,7 +506,7 @@ def _handle_message(update: dict[str, Any], claimed_update_id: int | None) -> tu
     chat_send_finalized = False
     try:
         started_at = time.monotonic()
-        result = send_message(chat_id, WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD)
+        result = send_welcome(chat_id)
         elapsed_ms = (time.monotonic() - started_at) * 1000
         log.info("/start @%s (%s) -> %s %.0fms", username, chat_id, result.value, elapsed_ms)
 
@@ -626,6 +652,7 @@ def health() -> tuple[dict[str, Any], int]:
         "seen_updates": len(_seen_update_ids),
         "keepalive_enabled": KEEPALIVE_ENABLED,
         "channel_id": CHANNEL_ID,
+        "welcome_photo": bool(WELCOME_PHOTO_FILE_ID),
     }, 200
 
 
