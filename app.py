@@ -118,6 +118,10 @@ _rate_limit_lock = threading.Lock()
 _last_start_by_chat_id: dict[int, float] = {}
 _inflight_start_chat_ids: set[int] = set()
 
+_callback_lock = threading.Lock()
+_last_callback_by_user_id: dict[int, float] = {}
+CALLBACK_RATE_LIMIT_SECONDS = int(os.environ.get("CALLBACK_RATE_LIMIT_SECONDS", "3"))
+
 _threads_started = False
 _threads_lock = threading.Lock()
 
@@ -217,10 +221,33 @@ def _release_chat_send(chat_id: int) -> None:
         _inflight_start_chat_ids.discard(chat_id)
 
 
-def _parse_retry_after(response: urllib3.HTTPResponse, parsed: dict[str, Any]) -> int:
+def _claim_callback(user_id: int) -> bool:
+    """Per-user rate limit for callback queries (prevents click-spam)."""
+    if CALLBACK_RATE_LIMIT_SECONDS <= 0:
+        return True
+    now = time.monotonic()
+    with _callback_lock:
+        last_seen = _last_callback_by_user_id.get(user_id)
+        if last_seen is not None and now - last_seen < CALLBACK_RATE_LIMIT_SECONDS:
+            return False
+        _last_callback_by_user_id[user_id] = now
+        # Prune stale entries if map gets too large
+        if len(_last_callback_by_user_id) > MAX_SEEN_UPDATE_IDS:
+            cutoff = now - CALLBACK_RATE_LIMIT_SECONDS
+            stale = [uid for uid, ts in _last_callback_by_user_id.items() if ts < cutoff]
+            for uid in stale:
+                _last_callback_by_user_id.pop(uid, None)
+        return True
+
+
+def _extract_retry_after(headers: Any, parsed: dict[str, Any]) -> int:
+    """Extract Retry-After from HTTP header or Telegram parameters.retry_after."""
     retry_after = 1
-    retry_header = response.headers.get("Retry-After")
-    if retry_header and retry_header.isdigit():
+    try:
+        retry_header = headers.get("Retry-After")
+    except AttributeError:
+        retry_header = None
+    if retry_header and str(retry_header).isdigit():
         retry_after = max(1, int(retry_header))
 
     parameters = parsed.get("parameters")
@@ -228,12 +255,11 @@ def _parse_retry_after(response: urllib3.HTTPResponse, parsed: dict[str, Any]) -
         maybe_retry = parameters.get("retry_after")
         if isinstance(maybe_retry, int):
             retry_after = max(1, maybe_retry)
-
     return retry_after
 
 
-def _tg_api_post(method: str, payload: dict[str, Any], read_timeout: float = 3.0) -> tuple[int, dict[str, Any]]:
-    """Single attempt POST to Telegram Bot API. Returns (http_status, parsed_body)."""
+def _tg_api_post(method: str, payload: dict[str, Any], read_timeout: float = 3.0) -> tuple[int, Any, dict[str, Any]]:
+    """Single attempt POST to Telegram Bot API. Returns (http_status, headers, parsed_body)."""
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     response = tg_pool.urlopen(
         "POST",
@@ -251,14 +277,14 @@ def _tg_api_post(method: str, payload: dict[str, Any], read_timeout: float = 3.0
             parsed = candidate
     except json.JSONDecodeError:
         parsed = {}
-    return response.status, parsed
+    return response.status, response.headers, parsed
 
 
 def _send_with_retries(api_method: str, payload: dict[str, Any], log_label: str) -> SendResult:
     """Common retry loop for sendMessage / sendPhoto / etc."""
     for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
         try:
-            status, parsed = _tg_api_post(api_method, payload)
+            status, headers, parsed = _tg_api_post(api_method, payload)
         except urllib3.exceptions.ReadTimeoutError as exc:
             log.warning("%s ambiguous read timeout: %s", log_label, _redact_secret(str(exc)))
             return SendResult.RETRYABLE_FAILURE
@@ -282,12 +308,7 @@ def _send_with_retries(api_method: str, payload: dict[str, Any], log_label: str)
         description = parsed.get("description")
 
         if status == 429 or err_code == 429:
-            retry_after = 1
-            parameters = parsed.get("parameters")
-            if isinstance(parameters, dict):
-                maybe_retry = parameters.get("retry_after")
-                if isinstance(maybe_retry, int):
-                    retry_after = max(1, maybe_retry)
+            retry_after = _extract_retry_after(headers, parsed)
             if retry_after <= SEND_RETRY_AFTER_LIMIT_SECONDS and attempt < MAX_SEND_ATTEMPTS:
                 log.warning("%s rate-limited attempt=%s retry_after=%ss", log_label, attempt, retry_after)
                 time.sleep(retry_after)
@@ -310,9 +331,11 @@ def _send_with_retries(api_method: str, payload: dict[str, Any], log_label: str)
             log.error("%s token/config error status=%s description=%s", log_label, status, description)
             return SendResult.RETRYABLE_FAILURE
 
-        if status >= 400:
-            log.warning("%s HTTP error status=%s error_code=%s description=%s", log_label, status, err_code, description)
-            return SendResult.RETRYABLE_FAILURE
+        # All remaining 4xx are client errors — permanent, not retryable
+        if 400 <= status < 500:
+            log.warning("%s HTTP 4xx (permanent) status=%s error_code=%s description=%s",
+                        log_label, status, err_code, description)
+            return SendResult.PERMANENT_FAILURE
 
         log.warning("%s unexpected body status=%s", log_label, status)
         return SendResult.RETRYABLE_FAILURE
@@ -356,7 +379,7 @@ def answer_callback_query(callback_id: str, text: str = "", show_alert: bool = F
         payload["text"] = text
         payload["show_alert"] = show_alert
     try:
-        _, parsed = _tg_api_post("answerCallbackQuery", payload, read_timeout=3.0)
+        _, _, parsed = _tg_api_post("answerCallbackQuery", payload, read_timeout=3.0)
         return parsed.get("ok") is True
     except Exception as exc:
         log.warning("answerCallbackQuery error: %s", _redact_secret(str(exc)))
@@ -367,7 +390,7 @@ def check_subscription(user_id: int) -> bool | None:
     """Returns True if subscribed, False if not, None on API error."""
     payload = {"chat_id": CHANNEL_ID, "user_id": user_id}
     try:
-        _, parsed = _tg_api_post("getChatMember", payload, read_timeout=4.0)
+        _, _, parsed = _tg_api_post("getChatMember", payload, read_timeout=4.0)
     except Exception as exc:
         log.warning("getChatMember error: %s", _redact_secret(str(exc)))
         return None
@@ -564,6 +587,14 @@ def _handle_callback_query(callback: dict[str, Any], claimed_update_id: int | No
             _commit_update(claimed_update_id)
         return "ok", 200, True
 
+    # Per-user rate limit: prevent click-spam from causing 50× getChatMember calls
+    if not _claim_callback(user_id):
+        answer_callback_query(callback_id, "Подожди немного…")
+        log.info("callback @%s (%s) data=%r -> throttled", username, user_id, data)
+        if claimed_update_id is not None:
+            _commit_update(claimed_update_id)
+        return "ok", 200, True
+
     if data == "check_sub":
         started_at = time.monotonic()
         subscribed = check_subscription(user_id)
@@ -650,6 +681,8 @@ def health() -> tuple[dict[str, Any], int]:
         "status": "ok",
         "inflight_updates": len(_inflight_update_ids),
         "seen_updates": len(_seen_update_ids),
+        "tracked_chats": len(_last_start_by_chat_id),
+        "tracked_callback_users": len(_last_callback_by_user_id),
         "keepalive_enabled": KEEPALIVE_ENABLED,
         "channel_id": CHANNEL_ID,
         "welcome_photo": bool(WELCOME_PHOTO_FILE_ID),
