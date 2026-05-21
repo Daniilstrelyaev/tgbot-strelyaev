@@ -1,13 +1,14 @@
+from __future__ import annotations
+
 import atexit
 import hmac
 import json
 import logging
 import os
-import queue
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 from urllib.parse import urlparse
 
@@ -27,9 +28,10 @@ WEBHOOK_SECRET = os.environ["TELEGRAM_WEBHOOK_SECRET"].strip()
 PORT = int(os.environ.get("PORT", "8080"))
 KEEPALIVE_ENABLED = os.environ.get("KEEPALIVE_ENABLED", "true").lower() in {"1", "true", "yes"}
 KEEPALIVE_INTERVAL_SECONDS = int(os.environ.get("KEEPALIVE_INTERVAL_SECONDS", "240"))
-SEND_QUEUE_MAX_SIZE = int(os.environ.get("SEND_QUEUE_MAX_SIZE", "1000"))
 MAX_SEEN_UPDATE_IDS = int(os.environ.get("MAX_SEEN_UPDATE_IDS", "10000"))
-MAX_SEND_ATTEMPTS = 3
+MAX_SEND_ATTEMPTS = int(os.environ.get("MAX_SEND_ATTEMPTS", "2"))
+SEND_RETRY_AFTER_LIMIT_SECONDS = int(os.environ.get("SEND_RETRY_AFTER_LIMIT_SECONDS", "2"))
+START_RATE_LIMIT_SECONDS = int(os.environ.get("START_RATE_LIMIT_SECONDS", "30"))
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is empty")
@@ -53,18 +55,9 @@ tg_pool = urllib3.HTTPSConnectionPool(
     block=True,
     cert_reqs="CERT_REQUIRED",
     ca_certs=certifi.where(),
-    retries=urllib3.Retry(connect=2, read=0, status=0, backoff_factor=0.2),
+    retries=urllib3.Retry(connect=1, read=0, status=0, redirect=0, backoff_factor=0.2),
 )
 
-
-@dataclass(slots=True)
-class SendTask:
-    chat_id: int
-    username: str
-    enqueued_at: float
-
-
-send_queue: queue.Queue[SendTask] = queue.Queue(maxsize=SEND_QUEUE_MAX_SIZE)
 stop_event = threading.Event()
 
 _updates_lock = threading.Lock()
@@ -72,8 +65,18 @@ _seen_update_ids: deque[int] = deque()
 _seen_update_ids_set: set[int] = set()
 _inflight_update_ids: set[int] = set()
 
+_rate_limit_lock = threading.Lock()
+_last_start_by_chat_id: dict[int, float] = {}
+_inflight_start_chat_ids: set[int] = set()
+
 _threads_started = False
 _threads_lock = threading.Lock()
+
+
+class SendResult(Enum):
+    OK = "ok"
+    PERMANENT_FAILURE = "permanent_failure"
+    RETRYABLE_FAILURE = "retryable_failure"
 
 
 def _redact_secret(value: str) -> str:
@@ -86,11 +89,6 @@ def _remember_update_locked(update_id: int) -> None:
     if len(_seen_update_ids) > MAX_SEEN_UPDATE_IDS:
         oldest = _seen_update_ids.popleft()
         _seen_update_ids_set.discard(oldest)
-
-
-def _remember_update(update_id: int) -> None:
-    with _updates_lock:
-        _remember_update_locked(update_id)
 
 
 def _claim_update(update_id: int) -> bool:
@@ -118,12 +116,74 @@ def _is_start_command(text: str) -> bool:
     parts = text.strip().split(maxsplit=1)
     if not parts:
         return False
-    token = parts[0]
-    command = token.split("@", 1)[0]
+    command = parts[0].split("@", 1)[0]
     return command == "/start"
 
 
-def send_message(chat_id: int, text: str) -> bool:
+def _prune_rate_limit_locked(now: float) -> None:
+    if len(_last_start_by_chat_id) <= MAX_SEEN_UPDATE_IDS:
+        return
+
+    cutoff = now - START_RATE_LIMIT_SECONDS
+    stale_chat_ids = [
+        stored_chat_id
+        for stored_chat_id, timestamp in _last_start_by_chat_id.items()
+        if timestamp < cutoff
+    ]
+    for stored_chat_id in stale_chat_ids:
+        _last_start_by_chat_id.pop(stored_chat_id, None)
+
+
+def _claim_chat_send(chat_id: int) -> bool:
+    if START_RATE_LIMIT_SECONDS <= 0:
+        return True
+
+    now = time.monotonic()
+    with _rate_limit_lock:
+        last_seen = _last_start_by_chat_id.get(chat_id)
+        if last_seen is not None and now - last_seen < START_RATE_LIMIT_SECONDS:
+            return False
+        if chat_id in _inflight_start_chat_ids:
+            return False
+
+        _inflight_start_chat_ids.add(chat_id)
+        _prune_rate_limit_locked(now)
+        return True
+
+
+def _commit_chat_send(chat_id: int) -> None:
+    if START_RATE_LIMIT_SECONDS <= 0:
+        return
+
+    with _rate_limit_lock:
+        _inflight_start_chat_ids.discard(chat_id)
+        _last_start_by_chat_id[chat_id] = time.monotonic()
+
+
+def _release_chat_send(chat_id: int) -> None:
+    if START_RATE_LIMIT_SECONDS <= 0:
+        return
+
+    with _rate_limit_lock:
+        _inflight_start_chat_ids.discard(chat_id)
+
+
+def _parse_retry_after(response: urllib3.HTTPResponse, parsed: dict[str, Any]) -> int:
+    retry_after = 1
+    retry_header = response.headers.get("Retry-After")
+    if retry_header and retry_header.isdigit():
+        retry_after = max(1, int(retry_header))
+
+    parameters = parsed.get("parameters")
+    if isinstance(parameters, dict):
+        maybe_retry = parameters.get("retry_after")
+        if isinstance(maybe_retry, int):
+            retry_after = max(1, maybe_retry)
+
+    return retry_after
+
+
+def send_message(chat_id: int, text: str) -> SendResult:
     payload = json.dumps({"chat_id": chat_id, "text": text}, ensure_ascii=False).encode("utf-8")
 
     for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
@@ -133,15 +193,23 @@ def send_message(chat_id: int, text: str) -> bool:
                 f"/bot{TOKEN}/sendMessage",
                 body=payload,
                 headers={"Content-Type": "application/json"},
-                timeout=urllib3.Timeout(connect=5, read=15),
+                timeout=urllib3.Timeout(connect=2, read=3),
+                redirect=False,
             )
+        except urllib3.exceptions.ReadTimeoutError as exc:
+            log.warning("sendMessage ambiguous read timeout: %s", _redact_secret(str(exc)))
+            return SendResult.RETRYABLE_FAILURE
         except urllib3.exceptions.HTTPError as exc:
-            log.warning("sendMessage transport error attempt %s: %s", attempt, _redact_secret(str(exc)))
-            time.sleep(0.5 * attempt)
+            log.warning("sendMessage transport error attempt=%s: %s", attempt, _redact_secret(str(exc)))
+            if attempt == MAX_SEND_ATTEMPTS:
+                return SendResult.RETRYABLE_FAILURE
+            time.sleep(0.3 * attempt)
             continue
         except Exception as exc:
-            log.warning("sendMessage unexpected error attempt %s: %s", attempt, _redact_secret(str(exc)))
-            time.sleep(0.5 * attempt)
+            log.warning("sendMessage unexpected error attempt=%s: %s", attempt, _redact_secret(str(exc)))
+            if attempt == MAX_SEND_ATTEMPTS:
+                return SendResult.RETRYABLE_FAILURE
+            time.sleep(0.3 * attempt)
             continue
 
         status = response.status
@@ -154,74 +222,49 @@ def send_message(chat_id: int, text: str) -> bool:
         except json.JSONDecodeError:
             parsed = {}
 
-        if status == 429 or parsed.get("error_code") == 429:
-            retry_after = 1
-            retry_header = response.headers.get("Retry-After")
-            if retry_header and retry_header.isdigit():
-                retry_after = max(1, int(retry_header))
-            parameters = parsed.get("parameters")
-            if isinstance(parameters, dict):
-                maybe_retry = parameters.get("retry_after")
-                if isinstance(maybe_retry, int):
-                    retry_after = max(1, maybe_retry)
-            retry_after = min(retry_after, 30)
-            log.warning("sendMessage rate-limited. attempt=%s retry_after=%ss", attempt, retry_after)
-            time.sleep(retry_after)
-            continue
+        if parsed.get("ok") is True:
+            return SendResult.OK
+
+        err_code = parsed.get("error_code")
+        description = parsed.get("description")
+
+        if status == 429 or err_code == 429:
+            retry_after = _parse_retry_after(response, parsed)
+            if retry_after <= SEND_RETRY_AFTER_LIMIT_SECONDS and attempt < MAX_SEND_ATTEMPTS:
+                log.warning("sendMessage rate-limited attempt=%s retry_after=%ss", attempt, retry_after)
+                time.sleep(retry_after)
+                continue
+            log.warning("sendMessage rate-limited; deferring to Telegram retry retry_after=%ss", retry_after)
+            return SendResult.RETRYABLE_FAILURE
 
         if 500 <= status < 600:
             log.warning("sendMessage upstream 5xx status=%s attempt=%s", status, attempt)
-            time.sleep(attempt)
+            if attempt == MAX_SEND_ATTEMPTS:
+                return SendResult.RETRYABLE_FAILURE
+            time.sleep(0.5 * attempt)
             continue
+
+        if err_code in (400, 403):
+            log.info("sendMessage permanent reject error_code=%s description=%s", err_code, description)
+            return SendResult.PERMANENT_FAILURE
+
+        if status in (401, 404):
+            log.error("sendMessage token/config error status=%s description=%s", status, description)
+            return SendResult.RETRYABLE_FAILURE
 
         if status >= 400:
             log.warning(
-                "sendMessage permanent HTTP error status=%s error_code=%s description=%s",
+                "sendMessage HTTP error status=%s error_code=%s description=%s",
                 status,
-                parsed.get("error_code"),
-                parsed.get("description"),
+                err_code,
+                description,
             )
-            return False
+            return SendResult.RETRYABLE_FAILURE
 
-        if parsed.get("ok") is True:
-            return True
+        log.warning("sendMessage unexpected body status=%s body=%s", status, body_text[:500])
+        return SendResult.RETRYABLE_FAILURE
 
-        err_code = parsed.get("error_code")
-        if err_code in (400, 403):
-            log.info("sendMessage rejected error_code=%s description=%s", err_code, parsed.get("description"))
-            return False
-
-        log.warning("sendMessage unexpected body attempt=%s status=%s body=%s", attempt, status, body_text[:500])
-        time.sleep(attempt)
-
-    log.error("sendMessage failed after %s attempts chat_id=%s", MAX_SEND_ATTEMPTS, chat_id)
-    return False
-
-
-def _sender_worker() -> None:
-    while not stop_event.is_set():
-        try:
-            task = send_queue.get(timeout=1)
-        except queue.Empty:
-            continue
-
-        started_at = time.monotonic()
-        try:
-            ok = send_message(task.chat_id, START_TEXT)
-        finally:
-            send_queue.task_done()
-
-        send_duration_ms = (time.monotonic() - started_at) * 1000
-        queue_duration_ms = (started_at - task.enqueued_at) * 1000
-        log.info(
-            "/start @%s (%s) -> %s send=%.0fms queue=%.0fms queue_size=%s",
-            task.username,
-            task.chat_id,
-            "ok" if ok else "FAIL",
-            send_duration_ms,
-            queue_duration_ms,
-            send_queue.qsize(),
-        )
+    return SendResult.RETRYABLE_FAILURE
 
 
 def _build_keepalive_target(service_url: str) -> tuple[Any | None, str, str]:
@@ -236,7 +279,7 @@ def _build_keepalive_target(service_url: str) -> tuple[Any | None, str, str]:
     base_path = parsed.path.rstrip("/")
     health_path = f"{base_path}/health" if base_path else "/health"
 
-    retries = urllib3.Retry(connect=2, read=0, status=0, backoff_factor=0.3)
+    retries = urllib3.Retry(connect=1, read=0, status=0, redirect=0, backoff_factor=0.3)
     if scheme == "https":
         pool = urllib3.HTTPSConnectionPool(
             host,
@@ -284,6 +327,7 @@ def _keepalive() -> None:
                 health_path,
                 timeout=urllib3.Timeout(connect=5, read=10),
                 headers={"User-Agent": "render-keepalive/1.0"},
+                redirect=False,
             )
             log.debug("[keepalive] ping #%s -> %s", cycle, response.status)
         except Exception as exc:
@@ -299,7 +343,6 @@ def _start_background_threads() -> None:
         if _threads_started:
             return
 
-        threading.Thread(target=_sender_worker, daemon=True, name="sender-worker").start()
         if KEEPALIVE_ENABLED:
             threading.Thread(target=_keepalive, daemon=True, name="keepalive").start()
         _threads_started = True
@@ -355,33 +398,51 @@ def webhook() -> tuple[str, int]:
             return "ok", 200
 
         chat_id = chat.get("id")
-        if not isinstance(chat_id, int):
+        if not isinstance(chat_id, int) or isinstance(chat_id, bool):
             if claimed_update_id is not None:
                 _commit_update(claimed_update_id)
                 update_finalized = True
             return "ok", 200
 
-        username = "—"
+        username = "-"
         from_user = message.get("from")
         if isinstance(from_user, dict):
             maybe_username = from_user.get("username")
             if isinstance(maybe_username, str) and maybe_username:
                 username = maybe_username
 
-        task = SendTask(chat_id=chat_id, username=username, enqueued_at=time.monotonic())
-        try:
-            send_queue.put_nowait(task)
+        claimed_chat_send = _claim_chat_send(chat_id)
+        chat_send_finalized = False
+        if not claimed_chat_send:
+            log.info("/start @%s (%s) -> throttled", username, chat_id)
             if claimed_update_id is not None:
                 _commit_update(claimed_update_id)
                 update_finalized = True
-        except queue.Full:
-            if claimed_update_id is not None:
-                _release_update(claimed_update_id)
-                update_finalized = True
-            log.error("send queue overflow; returning 503 for Telegram retry")
-            return "busy", 503
+            return "ok", 200
 
-        return "ok", 200
+        try:
+            started_at = time.monotonic()
+            result = send_message(chat_id, START_TEXT)
+            elapsed_ms = (time.monotonic() - started_at) * 1000
+            log.info("/start @%s (%s) -> %s %.0fms", username, chat_id, result.value, elapsed_ms)
+
+            if result is SendResult.RETRYABLE_FAILURE:
+                _release_chat_send(chat_id)
+                chat_send_finalized = True
+                if claimed_update_id is not None:
+                    _release_update(claimed_update_id)
+                    update_finalized = True
+                return "retry", 503
+
+            _commit_chat_send(chat_id)
+            chat_send_finalized = True
+            if claimed_update_id is not None:
+                _commit_update(claimed_update_id)
+                update_finalized = True
+            return "ok", 200
+        finally:
+            if not chat_send_finalized:
+                _release_chat_send(chat_id)
     finally:
         if claimed_update_id is not None and not update_finalized:
             _release_update(claimed_update_id)
@@ -389,7 +450,12 @@ def webhook() -> tuple[str, int]:
 
 @app.get("/health")
 def health() -> tuple[dict[str, Any], int]:
-    return {"status": "ok", "queue_size": send_queue.qsize()}, 200
+    return {
+        "status": "ok",
+        "inflight_updates": len(_inflight_update_ids),
+        "seen_updates": len(_seen_update_ids),
+        "keepalive_enabled": KEEPALIVE_ENABLED,
+    }, 200
 
 
 _start_background_threads()
