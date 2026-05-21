@@ -23,6 +23,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+DEFAULT_CHANNEL_URL = "https://t.me/strelyae_v"
+
 TOKEN = os.environ["BOT_TOKEN"].strip()
 WEBHOOK_SECRET = os.environ["TELEGRAM_WEBHOOK_SECRET"].strip()
 PORT = int(os.environ.get("PORT", "8080"))
@@ -32,19 +34,32 @@ MAX_SEEN_UPDATE_IDS = int(os.environ.get("MAX_SEEN_UPDATE_IDS", "10000"))
 MAX_SEND_ATTEMPTS = int(os.environ.get("MAX_SEND_ATTEMPTS", "2"))
 SEND_RETRY_AFTER_LIMIT_SECONDS = int(os.environ.get("SEND_RETRY_AFTER_LIMIT_SECONDS", "2"))
 START_RATE_LIMIT_SECONDS = int(os.environ.get("START_RATE_LIMIT_SECONDS", "30"))
+CALLBACK_RATE_LIMIT_SECONDS = int(os.environ.get("CALLBACK_RATE_LIMIT_SECONDS", "3"))
 
 CHANNEL_ID_RAW = os.environ.get("CHANNEL_ID", "-1003726576543").strip()
 try:
     CHANNEL_ID: int | str = int(CHANNEL_ID_RAW)
 except ValueError:
-    CHANNEL_ID = CHANNEL_ID_RAW  # @username form
-CHANNEL_URL = os.environ.get("CHANNEL_URL", "https://t.me/strelyae_v").strip()
+    CHANNEL_ID = CHANNEL_ID_RAW
+
+CHANNEL_URL = os.environ.get("CHANNEL_URL", DEFAULT_CHANNEL_URL).strip()
 WELCOME_PHOTO_FILE_ID = os.environ.get("WELCOME_PHOTO_FILE_ID", "").strip()
+APP_VERSION = os.environ.get("RENDER_GIT_COMMIT") or os.environ.get("APP_VERSION", "unknown")
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is empty")
 if not WEBHOOK_SECRET:
     raise RuntimeError("TELEGRAM_WEBHOOK_SECRET is empty")
+
+
+def _validate_button_url(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("CHANNEL_URL must be an absolute http(s) URL")
+    return value
+
+
+CHANNEL_URL = _validate_button_url(CHANNEL_URL)
 
 WELCOME_TEXT = (
     "Привет 👋\n\n"
@@ -74,20 +89,22 @@ SUBSCRIBED_TEXT = (
     "Контент выходит регулярно, не пропусти 🤍"
 )
 
+TEMPORARY_ERROR_TEXT = "Не получилось проверить подписку. Попробуй ещё раз через несколько секунд."
+CALLBACK_THROTTLED_TEXT = "Секунду, уже проверяю."
+GROUP_CONTEXT_TEXT = "Открой бота в личном чате и нажми /start."
+
 WELCOME_KEYBOARD = {
     "inline_keyboard": [
         [{"text": "✅ Я подписался", "callback_data": "check_sub"}],
         [{"text": "📢 Перейти на канал", "url": CHANNEL_URL}],
     ]
 }
-
 NOT_SUBSCRIBED_KEYBOARD = {
     "inline_keyboard": [
         [{"text": "Готово ✅", "callback_data": "check_sub"}],
         [{"text": "📢 Перейти на канал", "url": CHANNEL_URL}],
     ]
 }
-
 SUBSCRIBED_KEYBOARD = {
     "inline_keyboard": [
         [{"text": "📢 Открыть канал", "url": CHANNEL_URL}],
@@ -120,7 +137,7 @@ _inflight_start_chat_ids: set[int] = set()
 
 _callback_lock = threading.Lock()
 _last_callback_by_user_id: dict[int, float] = {}
-CALLBACK_RATE_LIMIT_SECONDS = int(os.environ.get("CALLBACK_RATE_LIMIT_SECONDS", "3"))
+_inflight_callback_user_ids: set[int] = set()
 
 _threads_started = False
 _threads_lock = threading.Lock()
@@ -132,8 +149,22 @@ class SendResult(Enum):
     RETRYABLE_FAILURE = "retryable_failure"
 
 
+class SubscriptionResult(Enum):
+    SUBSCRIBED = "subscribed"
+    NOT_SUBSCRIBED = "not_subscribed"
+    UNKNOWN = "unknown"
+
+
 def _redact_secret(value: str) -> str:
     return value.replace(TOKEN, "<BOT_TOKEN>")
+
+
+def _safe_log_value(value: Any, max_len: int = 80) -> str:
+    text = str(value)
+    text = text.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    if len(text) > max_len:
+        return f"{text[:max_len]}..."
+    return text
 
 
 def _remember_update_locked(update_id: int) -> None:
@@ -173,24 +204,18 @@ def _is_start_command(text: str) -> bool:
     return command == "/start"
 
 
-def _prune_rate_limit_locked(now: float) -> None:
-    if len(_last_start_by_chat_id) <= MAX_SEEN_UPDATE_IDS:
+def _prune_mapping_locked(values: dict[int, float], now: float, ttl_seconds: int) -> None:
+    if len(values) <= MAX_SEEN_UPDATE_IDS:
         return
-
-    cutoff = now - START_RATE_LIMIT_SECONDS
-    stale_chat_ids = [
-        stored_chat_id
-        for stored_chat_id, timestamp in _last_start_by_chat_id.items()
-        if timestamp < cutoff
-    ]
-    for stored_chat_id in stale_chat_ids:
-        _last_start_by_chat_id.pop(stored_chat_id, None)
+    cutoff = now - ttl_seconds
+    stale_keys = [key for key, timestamp in values.items() if timestamp < cutoff]
+    for key in stale_keys:
+        values.pop(key, None)
 
 
 def _claim_chat_send(chat_id: int) -> bool:
     if START_RATE_LIMIT_SECONDS <= 0:
         return True
-
     now = time.monotonic()
     with _rate_limit_lock:
         last_seen = _last_start_by_chat_id.get(chat_id)
@@ -198,16 +223,14 @@ def _claim_chat_send(chat_id: int) -> bool:
             return False
         if chat_id in _inflight_start_chat_ids:
             return False
-
         _inflight_start_chat_ids.add(chat_id)
-        _prune_rate_limit_locked(now)
+        _prune_mapping_locked(_last_start_by_chat_id, now, START_RATE_LIMIT_SECONDS)
         return True
 
 
 def _commit_chat_send(chat_id: int) -> None:
     if START_RATE_LIMIT_SECONDS <= 0:
         return
-
     with _rate_limit_lock:
         _inflight_start_chat_ids.discard(chat_id)
         _last_start_by_chat_id[chat_id] = time.monotonic()
@@ -216,13 +239,11 @@ def _commit_chat_send(chat_id: int) -> None:
 def _release_chat_send(chat_id: int) -> None:
     if START_RATE_LIMIT_SECONDS <= 0:
         return
-
     with _rate_limit_lock:
         _inflight_start_chat_ids.discard(chat_id)
 
 
 def _claim_callback(user_id: int) -> bool:
-    """Per-user rate limit for callback queries (prevents click-spam)."""
     if CALLBACK_RATE_LIMIT_SECONDS <= 0:
         return True
     now = time.monotonic()
@@ -230,18 +251,29 @@ def _claim_callback(user_id: int) -> bool:
         last_seen = _last_callback_by_user_id.get(user_id)
         if last_seen is not None and now - last_seen < CALLBACK_RATE_LIMIT_SECONDS:
             return False
-        _last_callback_by_user_id[user_id] = now
-        # Prune stale entries if map gets too large
-        if len(_last_callback_by_user_id) > MAX_SEEN_UPDATE_IDS:
-            cutoff = now - CALLBACK_RATE_LIMIT_SECONDS
-            stale = [uid for uid, ts in _last_callback_by_user_id.items() if ts < cutoff]
-            for uid in stale:
-                _last_callback_by_user_id.pop(uid, None)
+        if user_id in _inflight_callback_user_ids:
+            return False
+        _inflight_callback_user_ids.add(user_id)
+        _prune_mapping_locked(_last_callback_by_user_id, now, CALLBACK_RATE_LIMIT_SECONDS)
         return True
 
 
+def _commit_callback(user_id: int) -> None:
+    if CALLBACK_RATE_LIMIT_SECONDS <= 0:
+        return
+    with _callback_lock:
+        _inflight_callback_user_ids.discard(user_id)
+        _last_callback_by_user_id[user_id] = time.monotonic()
+
+
+def _release_callback(user_id: int) -> None:
+    if CALLBACK_RATE_LIMIT_SECONDS <= 0:
+        return
+    with _callback_lock:
+        _inflight_callback_user_ids.discard(user_id)
+
+
 def _extract_retry_after(headers: Any, parsed: dict[str, Any]) -> int:
-    """Extract Retry-After from HTTP header or Telegram parameters.retry_after."""
     retry_after = 1
     try:
         retry_header = headers.get("Retry-After")
@@ -249,17 +281,19 @@ def _extract_retry_after(headers: Any, parsed: dict[str, Any]) -> int:
         retry_header = None
     if retry_header and str(retry_header).isdigit():
         retry_after = max(1, int(retry_header))
-
     parameters = parsed.get("parameters")
     if isinstance(parameters, dict):
-        maybe_retry = parameters.get("retry_after")
-        if isinstance(maybe_retry, int):
-            retry_after = max(1, maybe_retry)
+        maybe = parameters.get("retry_after")
+        if isinstance(maybe, int):
+            retry_after = max(1, maybe)
     return retry_after
 
 
-def _tg_api_post(method: str, payload: dict[str, Any], read_timeout: float = 3.0) -> tuple[int, Any, dict[str, Any]]:
-    """Single attempt POST to Telegram Bot API. Returns (http_status, headers, parsed_body)."""
+def _tg_api_post(
+    method: str,
+    payload: dict[str, Any],
+    read_timeout: float = 3.0,
+) -> tuple[int, Any, dict[str, Any], str]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     response = tg_pool.urlopen(
         "POST",
@@ -267,6 +301,7 @@ def _tg_api_post(method: str, payload: dict[str, Any], read_timeout: float = 3.0
         body=body,
         headers={"Content-Type": "application/json"},
         timeout=urllib3.Timeout(connect=2, read=read_timeout),
+        pool_timeout=2.0,
         redirect=False,
     )
     body_text = response.data.decode("utf-8", errors="replace")
@@ -277,14 +312,18 @@ def _tg_api_post(method: str, payload: dict[str, Any], read_timeout: float = 3.0
             parsed = candidate
     except json.JSONDecodeError:
         parsed = {}
-    return response.status, response.headers, parsed
+    return response.status, response.headers, parsed, body_text
 
 
-def _send_with_retries(api_method: str, payload: dict[str, Any], log_label: str) -> SendResult:
-    """Common retry loop for sendMessage / sendPhoto / etc."""
+def _send_with_retries(
+    api_method: str,
+    payload: dict[str, Any],
+    log_label: str,
+    read_timeout: float = 3.0,
+) -> SendResult:
     for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
         try:
-            status, headers, parsed = _tg_api_post(api_method, payload)
+            status, headers, parsed, body_text = _tg_api_post(api_method, payload, read_timeout=read_timeout)
         except urllib3.exceptions.ReadTimeoutError as exc:
             log.warning("%s ambiguous read timeout: %s", log_label, _redact_secret(str(exc)))
             return SendResult.RETRYABLE_FAILURE
@@ -304,16 +343,16 @@ def _send_with_retries(api_method: str, payload: dict[str, Any], log_label: str)
         if parsed.get("ok") is True:
             return SendResult.OK
 
-        err_code = parsed.get("error_code")
-        description = parsed.get("description")
+        error_code = parsed.get("error_code")
+        description = _redact_secret(str(parsed.get("description", "")))
 
-        if status == 429 or err_code == 429:
+        if status == 429 or error_code == 429:
             retry_after = _extract_retry_after(headers, parsed)
             if retry_after <= SEND_RETRY_AFTER_LIMIT_SECONDS and attempt < MAX_SEND_ATTEMPTS:
                 log.warning("%s rate-limited attempt=%s retry_after=%ss", log_label, attempt, retry_after)
                 time.sleep(retry_after)
                 continue
-            log.warning("%s rate-limited; deferring to Telegram retry_after=%ss", log_label, retry_after)
+            log.warning("%s rate-limited; deferring to Telegram retry retry_after=%ss", log_label, retry_after)
             return SendResult.RETRYABLE_FAILURE
 
         if 500 <= status < 600:
@@ -323,21 +362,13 @@ def _send_with_retries(api_method: str, payload: dict[str, Any], log_label: str)
             time.sleep(0.5 * attempt)
             continue
 
-        if err_code in (400, 403):
-            log.info("%s permanent reject error_code=%s description=%s", log_label, err_code, description)
+        if 400 <= status < 500 or error_code in (400, 403):
+            log.info("%s permanent failure status=%s error_code=%s description=%s",
+                     log_label, status, error_code, description)
             return SendResult.PERMANENT_FAILURE
 
-        if status in (401, 404):
-            log.error("%s token/config error status=%s description=%s", log_label, status, description)
-            return SendResult.RETRYABLE_FAILURE
-
-        # All remaining 4xx are client errors — permanent, not retryable
-        if 400 <= status < 500:
-            log.warning("%s HTTP 4xx (permanent) status=%s error_code=%s description=%s",
-                        log_label, status, err_code, description)
-            return SendResult.PERMANENT_FAILURE
-
-        log.warning("%s unexpected body status=%s", log_label, status)
+        log.warning("%s unexpected body status=%s body=%s",
+                    log_label, status, _redact_secret(body_text[:500]))
         return SendResult.RETRYABLE_FAILURE
 
     return SendResult.RETRYABLE_FAILURE
@@ -345,29 +376,35 @@ def _send_with_retries(api_method: str, payload: dict[str, Any], log_label: str)
 
 def send_message(chat_id: int, text: str, reply_markup: dict[str, Any] | None = None) -> SendResult:
     payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
-    if reply_markup:
+    if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     return _send_with_retries("sendMessage", payload, "sendMessage")
 
 
-def send_photo(chat_id: int, photo: str, caption: str | None = None,
-               reply_markup: dict[str, Any] | None = None) -> SendResult:
+def send_photo(
+    chat_id: int,
+    photo: str,
+    caption: str | None = None,
+    reply_markup: dict[str, Any] | None = None,
+) -> SendResult:
     payload: dict[str, Any] = {"chat_id": chat_id, "photo": photo}
     if caption:
         payload["caption"] = caption
-    if reply_markup:
+    if reply_markup is not None:
         payload["reply_markup"] = reply_markup
-    return _send_with_retries("sendPhoto", payload, "sendPhoto")
+    return _send_with_retries("sendPhoto", payload, "sendPhoto", read_timeout=5.0)
 
 
 def send_welcome(chat_id: int) -> SendResult:
-    """Send welcome message with photo (if configured) or fall back to text-only."""
     if WELCOME_PHOTO_FILE_ID:
-        result = send_photo(chat_id, WELCOME_PHOTO_FILE_ID,
-                            caption=WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD)
-        # If photo failed permanently (e.g. invalid file_id), fall back to text
+        result = send_photo(
+            chat_id,
+            WELCOME_PHOTO_FILE_ID,
+            caption=WELCOME_TEXT,
+            reply_markup=WELCOME_KEYBOARD,
+        )
         if result is SendResult.PERMANENT_FAILURE:
-            log.warning("sendPhoto failed permanently, falling back to text-only welcome")
+            log.warning("sendPhoto failed permanently; falling back to text welcome")
             return send_message(chat_id, WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD)
         return result
     return send_message(chat_id, WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD)
@@ -379,31 +416,47 @@ def answer_callback_query(callback_id: str, text: str = "", show_alert: bool = F
         payload["text"] = text
         payload["show_alert"] = show_alert
     try:
-        _, _, parsed = _tg_api_post("answerCallbackQuery", payload, read_timeout=3.0)
-        return parsed.get("ok") is True
+        _, _, parsed, _ = _tg_api_post("answerCallbackQuery", payload, read_timeout=3.0)
     except Exception as exc:
-        log.warning("answerCallbackQuery error: %s", _redact_secret(str(exc)))
+        log.warning("answerCallbackQuery failed: %s", _redact_secret(str(exc)))
         return False
+    ok = parsed.get("ok") is True
+    if not ok:
+        log.info("answerCallbackQuery rejected: %s", _redact_secret(str(parsed.get("description", ""))))
+    return ok
 
 
-def check_subscription(user_id: int) -> bool | None:
-    """Returns True if subscribed, False if not, None on API error."""
+def check_subscription(user_id: int) -> SubscriptionResult:
     payload = {"chat_id": CHANNEL_ID, "user_id": user_id}
     try:
-        _, _, parsed = _tg_api_post("getChatMember", payload, read_timeout=4.0)
+        status, _, parsed, _ = _tg_api_post("getChatMember", payload, read_timeout=4.0)
     except Exception as exc:
-        log.warning("getChatMember error: %s", _redact_secret(str(exc)))
-        return None
+        log.warning("getChatMember failed user_id=%s: %s", user_id, _redact_secret(str(exc)))
+        return SubscriptionResult.UNKNOWN
 
-    if not parsed.get("ok"):
-        log.warning("getChatMember failed: %s", parsed.get("description"))
-        return None
+    if status >= 500 or parsed.get("error_code") == 429:
+        return SubscriptionResult.UNKNOWN
+    if parsed.get("ok") is not True:
+        log.warning(
+            "getChatMember rejected status=%s error_code=%s description=%s",
+            status,
+            parsed.get("error_code"),
+            _redact_secret(str(parsed.get("description", ""))),
+        )
+        return SubscriptionResult.UNKNOWN
 
     result = parsed.get("result")
     if not isinstance(result, dict):
-        return None
-    status = result.get("status")
-    return status in ("member", "administrator", "creator", "restricted")
+        return SubscriptionResult.UNKNOWN
+
+    member_status = result.get("status")
+    if member_status in {"creator", "administrator", "member"}:
+        return SubscriptionResult.SUBSCRIBED
+    if member_status == "restricted" and result.get("is_member") is True:
+        return SubscriptionResult.SUBSCRIBED
+    if member_status in {"left", "kicked", "restricted"}:
+        return SubscriptionResult.NOT_SUBSCRIBED
+    return SubscriptionResult.UNKNOWN
 
 
 def _build_keepalive_target(service_url: str) -> tuple[Any | None, str, str]:
@@ -421,8 +474,11 @@ def _build_keepalive_target(service_url: str) -> tuple[Any | None, str, str]:
     retries = urllib3.Retry(connect=1, read=0, status=0, redirect=0, backoff_factor=0.3)
     if scheme == "https":
         pool = urllib3.HTTPSConnectionPool(
-            host, port=port, maxsize=1,
-            cert_reqs="CERT_REQUIRED", ca_certs=certifi.where(),
+            host,
+            port=port,
+            maxsize=1,
+            cert_reqs="CERT_REQUIRED",
+            ca_certs=certifi.where(),
             retries=retries,
         )
     else:
@@ -459,8 +515,10 @@ def _keepalive() -> None:
 
         try:
             response = pool.urlopen(
-                "GET", health_path,
+                "GET",
+                health_path,
                 timeout=urllib3.Timeout(connect=5, read=10),
+                pool_timeout=2.0,
                 headers={"User-Agent": "render-keepalive/1.0"},
                 redirect=False,
             )
@@ -477,7 +535,6 @@ def _start_background_threads() -> None:
     with _threads_lock:
         if _threads_started:
             return
-
         if KEEPALIVE_ENABLED:
             threading.Thread(target=_keepalive, daemon=True, name="keepalive").start()
         _threads_started = True
@@ -487,46 +544,52 @@ def _shutdown_background_threads() -> None:
     stop_event.set()
 
 
+def _commit_if_claimed(update_id: int | None) -> bool:
+    if update_id is None:
+        return True
+    _commit_update(update_id)
+    return True
+
+
 def _handle_message(update: dict[str, Any], claimed_update_id: int | None) -> tuple[str, int, bool]:
-    """Returns (body, status, update_finalized)."""
     message = update.get("message")
     if not isinstance(message, dict):
-        if claimed_update_id is not None:
-            _commit_update(claimed_update_id)
-        return "ok", 200, True
+        return "ok", 200, _commit_if_claimed(claimed_update_id)
 
     text = message.get("text")
     chat = message.get("chat")
     if not isinstance(text, str) or not isinstance(chat, dict):
-        if claimed_update_id is not None:
-            _commit_update(claimed_update_id)
-        return "ok", 200, True
-
+        return "ok", 200, _commit_if_claimed(claimed_update_id)
     if not _is_start_command(text):
-        if claimed_update_id is not None:
-            _commit_update(claimed_update_id)
-        return "ok", 200, True
+        return "ok", 200, _commit_if_claimed(claimed_update_id)
 
     chat_id = chat.get("id")
     if not isinstance(chat_id, int) or isinstance(chat_id, bool):
-        if claimed_update_id is not None:
-            _commit_update(claimed_update_id)
-        return "ok", 200, True
+        return "ok", 200, _commit_if_claimed(claimed_update_id)
+
+    chat_type = chat.get("type")
+    if chat_type != "private":
+        from_user = message.get("from")
+        user_id = from_user.get("id") if isinstance(from_user, dict) else None
+        if isinstance(user_id, int) and not isinstance(user_id, bool):
+            answer_result = send_message(user_id, GROUP_CONTEXT_TEXT)
+            if answer_result is SendResult.RETRYABLE_FAILURE:
+                return "retry", 503, False
+        return "ok", 200, _commit_if_claimed(claimed_update_id)
 
     username = "-"
     from_user = message.get("from")
     if isinstance(from_user, dict):
         maybe_username = from_user.get("username")
         if isinstance(maybe_username, str) and maybe_username:
-            username = maybe_username
+            username = _safe_log_value(maybe_username)
 
-    if not _claim_chat_send(chat_id):
-        log.info("/start @%s (%s) -> throttled", username, chat_id)
-        if claimed_update_id is not None:
-            _commit_update(claimed_update_id)
-        return "ok", 200, True
-
+    claimed_chat_send = _claim_chat_send(chat_id)
     chat_send_finalized = False
+    if not claimed_chat_send:
+        log.info("/start @%s (%s) -> throttled", username, chat_id)
+        return "ok", 200, _commit_if_claimed(claimed_update_id)
+
     try:
         started_at = time.monotonic()
         result = send_welcome(chat_id)
@@ -536,112 +599,83 @@ def _handle_message(update: dict[str, Any], claimed_update_id: int | None) -> tu
         if result is SendResult.RETRYABLE_FAILURE:
             _release_chat_send(chat_id)
             chat_send_finalized = True
-            if claimed_update_id is not None:
-                _release_update(claimed_update_id)
-            return "retry", 503, True
+            return "retry", 503, False
 
         _commit_chat_send(chat_id)
         chat_send_finalized = True
-        if claimed_update_id is not None:
-            _commit_update(claimed_update_id)
-        return "ok", 200, True
+        return "ok", 200, _commit_if_claimed(claimed_update_id)
     finally:
         if not chat_send_finalized:
             _release_chat_send(chat_id)
 
 
-def _handle_callback_query(callback: dict[str, Any], claimed_update_id: int | None) -> tuple[str, int, bool]:
-    callback_id = callback.get("id")
-    data = callback.get("data")
-    if not isinstance(callback_id, str) or not isinstance(data, str):
-        if claimed_update_id is not None:
-            _commit_update(claimed_update_id)
-        return "ok", 200, True
+def _handle_callback_query(callback_query: dict[str, Any], claimed_update_id: int | None) -> tuple[str, int, bool]:
+    callback_id = callback_query.get("id")
+    from_user = callback_query.get("from")
+    data = callback_query.get("data")
 
-    from_user = callback.get("from")
-    if not isinstance(from_user, dict):
-        if claimed_update_id is not None:
-            _commit_update(claimed_update_id)
-        return "ok", 200, True
+    if not isinstance(callback_id, str) or not isinstance(from_user, dict):
+        return "ok", 200, _commit_if_claimed(claimed_update_id)
 
     user_id = from_user.get("id")
     if not isinstance(user_id, int) or isinstance(user_id, bool):
-        if claimed_update_id is not None:
-            _commit_update(claimed_update_id)
-        return "ok", 200, True
+        answer_callback_query(callback_id, "Не получилось определить пользователя.", show_alert=True)
+        return "ok", 200, _commit_if_claimed(claimed_update_id)
 
-    username = from_user.get("username") if isinstance(from_user.get("username"), str) else "-"
+    username = "-"
+    maybe_username = from_user.get("username")
+    if isinstance(maybe_username, str) and maybe_username:
+        username = _safe_log_value(maybe_username)
 
-    message = callback.get("message")
-    chat_id: int | None = None
-    if isinstance(message, dict):
-        chat = message.get("chat")
-        if isinstance(chat, dict):
-            maybe_chat_id = chat.get("id")
-            if isinstance(maybe_chat_id, int) and not isinstance(maybe_chat_id, bool):
-                chat_id = maybe_chat_id
-
-    if chat_id is None:
+    if data != "check_sub":
         answer_callback_query(callback_id)
-        if claimed_update_id is not None:
-            _commit_update(claimed_update_id)
-        return "ok", 200, True
+        log.info("callback @%s (%s) -> ignored data=%s", username, user_id, _safe_log_value(data))
+        return "ok", 200, _commit_if_claimed(claimed_update_id)
 
-    # Per-user rate limit: prevent click-spam from causing 50× getChatMember calls
-    if not _claim_callback(user_id):
-        answer_callback_query(callback_id, "Подожди немного…")
-        log.info("callback @%s (%s) data=%r -> throttled", username, user_id, data)
-        if claimed_update_id is not None:
-            _commit_update(claimed_update_id)
-        return "ok", 200, True
+    claimed_callback = _claim_callback(user_id)
+    callback_finalized = False
+    if not claimed_callback:
+        answer_callback_query(callback_id, CALLBACK_THROTTLED_TEXT)
+        log.info("callback @%s (%s) -> throttled", username, user_id)
+        return "ok", 200, _commit_if_claimed(claimed_update_id)
 
-    if data == "check_sub":
-        started_at = time.monotonic()
-        subscribed = check_subscription(user_id)
-        check_ms = (time.monotonic() - started_at) * 1000
+    try:
+        subscription = check_subscription(user_id)
+        if subscription is SubscriptionResult.UNKNOWN:
+            answer_callback_query(callback_id, TEMPORARY_ERROR_TEXT, show_alert=True)
+            _release_callback(user_id)
+            callback_finalized = True
+            log.warning("callback @%s (%s) -> subscription_unknown", username, user_id)
+            return "ok", 200, _commit_if_claimed(claimed_update_id)
 
-        if subscribed is None:
-            answer_callback_query(callback_id, "Произошла ошибка, попробуй ещё раз", show_alert=True)
-            log.warning("check_sub @%s (%s) -> API error %.0fms", username, user_id, check_ms)
-            if claimed_update_id is not None:
-                _release_update(claimed_update_id)
-            return "retry", 503, True
-
-        if subscribed:
-            answer_callback_query(callback_id, "Подписка подтверждена ✅")
-            result = send_message(chat_id, SUBSCRIBED_TEXT, reply_markup=SUBSCRIBED_KEYBOARD)
-            log.info("check_sub @%s (%s) -> SUBSCRIBED send=%s %.0fms",
-                     username, user_id, result.value, check_ms)
-            if result is SendResult.RETRYABLE_FAILURE:
-                if claimed_update_id is not None:
-                    _release_update(claimed_update_id)
-                return "retry", 503, True
+        if subscription is SubscriptionResult.SUBSCRIBED:
+            answer_callback_query(callback_id, "Готово ✅")
+            result = send_message(user_id, SUBSCRIBED_TEXT, reply_markup=SUBSCRIBED_KEYBOARD)
+            outcome = "subscribed"
         else:
-            answer_callback_query(callback_id, "Не вижу подписки 😔", show_alert=False)
-            result = send_message(chat_id, NOT_SUBSCRIBED_TEXT, reply_markup=NOT_SUBSCRIBED_KEYBOARD)
-            log.info("check_sub @%s (%s) -> NOT SUBSCRIBED send=%s %.0fms",
-                     username, user_id, result.value, check_ms)
-            if result is SendResult.RETRYABLE_FAILURE:
-                if claimed_update_id is not None:
-                    _release_update(claimed_update_id)
-                return "retry", 503, True
+            answer_callback_query(callback_id, "Подписку пока не вижу", show_alert=True)
+            result = send_message(user_id, NOT_SUBSCRIBED_TEXT, reply_markup=NOT_SUBSCRIBED_KEYBOARD)
+            outcome = "not_subscribed"
 
-        if claimed_update_id is not None:
-            _commit_update(claimed_update_id)
-        return "ok", 200, True
+        log.info("callback @%s (%s) -> %s send=%s", username, user_id, outcome, result.value)
 
-    # Unknown callback data — just ack
-    answer_callback_query(callback_id)
-    log.info("unknown callback data=%r from @%s (%s)", data, username, user_id)
-    if claimed_update_id is not None:
-        _commit_update(claimed_update_id)
-    return "ok", 200, True
+        if result is SendResult.RETRYABLE_FAILURE:
+            _release_callback(user_id)
+            callback_finalized = True
+            return "retry", 503, False
+
+        _commit_callback(user_id)
+        callback_finalized = True
+        return "ok", 200, _commit_if_claimed(claimed_update_id)
+    finally:
+        if not callback_finalized:
+            _release_callback(user_id)
 
 
 @app.post("/webhook")
 def webhook() -> tuple[str, int]:
-    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if not hmac.compare_digest(secret_header, WEBHOOK_SECRET):
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(secret, WEBHOOK_SECRET):
         abort(403)
 
     if not request.is_json:
@@ -652,37 +686,48 @@ def webhook() -> tuple[str, int]:
         abort(400)
 
     update_id_value = update.get("update_id")
-    has_update_id = isinstance(update_id_value, int) and not isinstance(update_id_value, bool)
-    update_id = update_id_value if has_update_id else None
-    claimed_update_id: int | None = None
+    if not isinstance(update_id_value, int) or isinstance(update_id_value, bool):
+        log.warning("dropping malformed update without valid update_id")
+        return "ok", 200
 
-    if update_id is not None:
-        if not _claim_update(update_id):
-            return "ok", 200
-        claimed_update_id = update_id
+    if not _claim_update(update_id_value):
+        return "ok", 200
 
-    update_finalized = False
+    finalized = False
     try:
-        callback = update.get("callback_query")
-        if isinstance(callback, dict):
-            body, status, update_finalized = _handle_callback_query(callback, claimed_update_id)
+        callback_query = update.get("callback_query")
+        if isinstance(callback_query, dict):
+            body, status, finalized = _handle_callback_query(callback_query, update_id_value)
             return body, status
 
-        body, status, update_finalized = _handle_message(update, claimed_update_id)
+        body, status, finalized = _handle_message(update, update_id_value)
         return body, status
     finally:
-        if claimed_update_id is not None and not update_finalized:
-            _release_update(claimed_update_id)
+        if not finalized:
+            _release_update(update_id_value)
 
 
 @app.get("/health")
 def health() -> tuple[dict[str, Any], int]:
+    with _updates_lock:
+        inflight_updates = len(_inflight_update_ids)
+        seen_updates = len(_seen_update_ids)
+    with _rate_limit_lock:
+        tracked_chats = len(_last_start_by_chat_id)
+        inflight_chats = len(_inflight_start_chat_ids)
+    with _callback_lock:
+        tracked_callback_users = len(_last_callback_by_user_id)
+        inflight_callback_users = len(_inflight_callback_user_ids)
+
     return {
         "status": "ok",
-        "inflight_updates": len(_inflight_update_ids),
-        "seen_updates": len(_seen_update_ids),
-        "tracked_chats": len(_last_start_by_chat_id),
-        "tracked_callback_users": len(_last_callback_by_user_id),
+        "version": APP_VERSION,
+        "inflight_updates": inflight_updates,
+        "seen_updates": seen_updates,
+        "tracked_chats": tracked_chats,
+        "inflight_chats": inflight_chats,
+        "tracked_callback_users": tracked_callback_users,
+        "inflight_callback_users": inflight_callback_users,
         "keepalive_enabled": KEEPALIVE_ENABLED,
         "channel_id": CHANNEL_ID,
         "welcome_photo": bool(WELCOME_PHOTO_FILE_ID),
