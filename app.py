@@ -90,19 +90,19 @@ def _validate_button_url(value: str) -> str:
 CHANNEL_URL = _validate_button_url(CHANNEL_URL)
 
 # ── ТЕКСТЫ СООБЩЕНИЙ (меняй здесь) ────────────────────────────────────────────
+# ВАЖНО: текст в формате HTML (parse_mode=HTML). Жирный = <b>...</b>
 WELCOME_TEXT = (
-    "Привет 👋\n\n"
-    "Меня зовут Даниил — я создаю AI-контент\n"
-    "и обучаю людей делать вирусные видео\n"
-    "через нейросети и зарабатывать на этом.\n\n"
-    "35 млн просмотров на AI-контенте.\n"
-    "8,6 млн на одном ролике.\n"
-    "61 500 подписчиков за 66 дней.\n\n"
-    "Подготовил для тебя бесплатный гайд\n"
-    "«Оплата нейросетей без хаоса» —\n"
-    "внутри все сервисы, ссылки и как платить из РФ.\n\n"
-    "Чтобы забрать гайд — подпишись на канал\n"
-    "и нажми кнопку ниже 👇"
+    "Привет! 👋\n\n"
+    "Меня зовут <b>Даниил</b> — я создаю AI-контент и обучаю людей "
+    "делать вирусные видео через нейросети и зарабатывать на этом.\n\n"
+    "📊 Мои цифры:\n"
+    "• <b>35 млн</b> просмотров на AI-контенте\n"
+    "• <b>8,6 млн</b> на одном ролике\n"
+    "• <b>61 500</b> подписчиков за <b>66 дней</b>\n\n"
+    "🎁 Подготовил для тебя бесплатный гайд\n"
+    "<b>«Оплата нейросетей без хаоса»</b> — внутри все сервисы, "
+    "ссылки и как платить из РФ без проблем.\n\n"
+    "👇 Чтобы забрать гайд — <b>подпишись на канал</b> и нажми кнопку ниже."
 )
 
 NOT_SUBSCRIBED_TEXT = (
@@ -111,16 +111,20 @@ NOT_SUBSCRIBED_TEXT = (
     "и я сразу пришлю гайд 🤍"
 )
 
-# Текст-подпись к PDF-гайду (блок 1)
+# Текст-подпись к PDF-гайду (блок 1), формат HTML
 LEAD_MAGNET_CAPTION = (
     "Держи гайд по оплате нейросетей из РФ 🎬\n\n"
-    "Внутри — все сервисы, ссылки и как платить без хаоса.\n\n"
-    "Когда подготовишь доступы — переходи к следующему шагу."
+    "Внутри — <b>все сервисы, ссылки</b> и как платить без хаоса.\n\n"
+    "Когда подготовишь доступы — переходи к следующему шагу 🚀"
 )
 
 MENU_TEXT = "Выбери, что нужно 👇"
 REVIEW_INTRO_TEXT = "Окей, погнали 🔥\nОтветь на 4 коротких вопроса."
-REVIEW_DONE_TEXT = "Спасибо! Свяжусь с тобой и назначим разбор 🔥"
+# Финал анкеты. БЕЗ кнопки «Хочу разбор» — чтобы случайно не перезапустить анкету.
+REVIEW_DONE_TEXT = (
+    "Спасибо! Свяжусь с тобой и назначим разбор 🔥\n\n"
+    "А пока — загляни в канал 👇"
+)
 CANCEL_TEXT = "Ок, отменил. Если что — жми /menu."
 
 TEMPORARY_ERROR_TEXT = "Не получилось проверить подписку. Попробуй ещё раз через несколько секунд."
@@ -153,6 +157,13 @@ MENU_KEYBOARD = {
     "inline_keyboard": [
         [{"text": "📥 Забрать гайд", "callback_data": "get_guide"}],
         [{"text": "🎯 Хочу разбор", "callback_data": "want_review"}],
+        [{"text": "📣 Канал", "url": CHANNEL_URL}],
+    ]
+}
+# Клавиатура после завершения анкеты — только ссылка на канал.
+# Намеренно НЕТ кнопки «Хочу разбор», чтобы анкета не запускалась случайно.
+COMPLETION_KEYBOARD = {
+    "inline_keyboard": [
         [{"text": "📣 Канал", "url": CHANNEL_URL}],
     ]
 }
@@ -391,9 +402,11 @@ def _process_review_answer(user_id: int, text: str, username: str) -> None:
 
 
 def _finish_review(user_id: int, username: str, answers: dict[str, str]) -> None:
+    _clear_fsm(user_id)  # гарантированно сбрасываем состояние (защита от зацикливания)
     _send_lead_to_admin(user_id, username, answers)
     _save_lead_csv(user_id, username, answers)
-    send_message(user_id, REVIEW_DONE_TEXT, reply_markup=MENU_KEYBOARD)
+    # ВАЖНО: COMPLETION_KEYBOARD (без кнопки «Хочу разбор»), чтобы анкета не перезапускалась
+    send_message(user_id, REVIEW_DONE_TEXT, reply_markup=COMPLETION_KEYBOARD)
 
 
 def _send_lead_to_admin(user_id: int, username: str, answers: dict[str, str]) -> None:
@@ -543,30 +556,37 @@ def _send_with_retries(
     return SendResult.RETRYABLE_FAILURE
 
 
-def send_message(chat_id: int, text: str, reply_markup: dict[str, Any] | None = None) -> SendResult:
+def send_message(chat_id: int, text: str, reply_markup: dict[str, Any] | None = None,
+                 parse_mode: str | None = None) -> SendResult:
     payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     return _send_with_retries("sendMessage", payload=payload, log_label="sendMessage")
 
 
 def send_photo(chat_id: int, photo: str, caption: str | None = None,
-               reply_markup: dict[str, Any] | None = None) -> SendResult:
+               reply_markup: dict[str, Any] | None = None, parse_mode: str | None = None) -> SendResult:
     payload: dict[str, Any] = {"chat_id": chat_id, "photo": photo}
     if caption:
         payload["caption"] = caption
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     return _send_with_retries("sendPhoto", payload=payload, log_label="sendPhoto", read_timeout=5.0)
 
 
-def send_document(chat_id: int, caption: str | None = None) -> SendResult:
+def send_document(chat_id: int, caption: str | None = None, parse_mode: str | None = None) -> SendResult:
     """Отправляет PDF-гайд: по file_id (быстро) или загрузкой файла с диска."""
     # Вариант 1 — по file_id (мгновенно, рекомендуется)
     if LEAD_MAGNET_FILE_ID:
         payload: dict[str, Any] = {"chat_id": chat_id, "document": LEAD_MAGNET_FILE_ID}
         if caption:
             payload["caption"] = caption
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         return _send_with_retries("sendDocument", payload=payload, log_label="sendDocument", read_timeout=10.0)
 
     # Вариант 2 — загрузка файла с диска по пути LEAD_MAGNET_PATH
@@ -584,6 +604,8 @@ def send_document(chat_id: int, caption: str | None = None) -> SendResult:
         }
         if caption:
             fields["caption"] = caption
+        if parse_mode:
+            fields["parse_mode"] = parse_mode
         return _send_with_retries("sendDocument", log_label="sendDocument",
                                   read_timeout=20.0, multipart_fields=fields)
 
@@ -593,12 +615,13 @@ def send_document(chat_id: int, caption: str | None = None) -> SendResult:
 
 def send_welcome(chat_id: int) -> SendResult:
     if WELCOME_PHOTO_FILE_ID:
-        result = send_photo(chat_id, WELCOME_PHOTO_FILE_ID, caption=WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD)
+        result = send_photo(chat_id, WELCOME_PHOTO_FILE_ID, caption=WELCOME_TEXT,
+                            reply_markup=WELCOME_KEYBOARD, parse_mode="HTML")
         if result is SendResult.PERMANENT_FAILURE:
             log.warning("sendPhoto failed permanently; fallback to text welcome")
-            return send_message(chat_id, WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD)
+            return send_message(chat_id, WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD, parse_mode="HTML")
         return result
-    return send_message(chat_id, WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD)
+    return send_message(chat_id, WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD, parse_mode="HTML")
 
 
 def answer_callback_query(callback_id: str, text: str = "", show_alert: bool = False) -> bool:
@@ -657,7 +680,7 @@ def _deliver_guide(user_id: int, callback_id: str | None = None) -> str:
     if subscription is SubscriptionResult.SUBSCRIBED:
         if callback_id:
             answer_callback_query(callback_id, "Готово ✅")
-        send_document(user_id, caption=LEAD_MAGNET_CAPTION)
+        send_document(user_id, caption=LEAD_MAGNET_CAPTION, parse_mode="HTML")
         return "subscribed"
 
     # не подписан
