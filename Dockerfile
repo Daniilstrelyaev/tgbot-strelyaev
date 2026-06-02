@@ -14,6 +14,11 @@ COPY requirements.txt .
 RUN python -m pip install --upgrade pip && pip install -r requirements.txt
 
 COPY --chown=app:app app.py .
+# Лид-магнит (PDF-гайд) кладём в образ, чтобы бот мог его отправлять
+COPY --chown=app:app lead_magnet.pdf .
+
+# Делаем рабочую папку доступной для записи (leads.csv пишется сюда)
+RUN chown app:app /app
 
 USER app
 
