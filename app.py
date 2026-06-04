@@ -60,7 +60,9 @@ LEAD_MAGNET_PATH = os.environ.get("LEAD_MAGNET_PATH", "lead_magnet.pdf").strip()
 # ── АДМИН (куда падают заявки на разбор) ──────────────────────────────────────
 # Узнать свой ID: напиши боту команду /id — он пришлёт твой числовой ID.
 # Потом добавь его на Render как переменную ADMIN_ID.
-ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "").strip()
+# По умолчанию — ID Даниила (заявки «разбор» идут ему в личку).
+# Можно переопределить переменной ADMIN_ID на Render.
+ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "919430302").strip()
 try:
     ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW else 0
 except ValueError:
@@ -149,6 +151,18 @@ LEAD_MAGNETS: dict[str, dict[str, str]] = {
             "Внутри — инструменты и приёмы, чтобы собирать ролики "
             "красиво и быстро.\n\n"
             "Приятного просмотра 🚀"
+        ),
+    },
+
+    # СТАРТ (Instagram-слово «старт») — чек-лист запуска блога на нейросетях
+    "start": {
+        "file_id": "BQACAgIAAyEGAATeHwufAAMaaiHQxW8QTJwGVDSphGpm3ESJbhwAAgqYAALHLQlJ6vrI25R2ewI7BA",
+        "caption": (
+            "Держи <b>чек-лист запуска блога на нейросетях</b> 🚀\n\n"
+            "Внутри — 5 настроек, которые стоит сделать ДО первого поста, "
+            "плюс стартовая связка.\n\n"
+            "Когда будешь готов разобрать свой запуск лично — "
+            "напиши мне слово <b>РАЗБОР</b> 🔥"
         ),
     },
 }
