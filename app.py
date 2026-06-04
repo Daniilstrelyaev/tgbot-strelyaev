@@ -130,9 +130,28 @@ LEAD_MAGNETS: dict[str, dict[str, str]] = {
     # default — текущий гайд. file_id берётся из LEAD_MAGNET_FILE_ID
     # (или файл lead_magnet.pdf с диска, если file_id не задан).
     "default": {"file_id": LEAD_MAGNET_FILE_ID, "caption": LEAD_MAGNET_CAPTION},
-    # Примеры — раскомментируй и подставь свой file_id, когда пришлёшь PDF:
-    # "reels": {"file_id": "BQAC...", "caption": "Держи гайд по Reels 🎬"},
-    # "ai":    {"file_id": "BQAC...", "caption": "Держи связки нейросетей 🤖"},
+
+    # СВЯЗКА (Instagram-слово «связка») — тёмный PDF
+    "svyazka": {
+        "file_id": "BQACAgIAAyEGAATeHwufAAMZaiFH00BFDicsIKZdD1rjVDrDbUwAArubAAK02QlJOg6WsLuL4hk7BA",
+        "caption": (
+            "Держи <b>связки нейросетей</b> для вирусного контента 🤖\n\n"
+            "Внутри — рабочие связки сервисов: что с чем сочетать, "
+            "чтобы делать ролики быстро.\n\n"
+            "Забирай и внедряй 🚀"
+        ),
+    },
+
+    # МОНТАЖ (Instagram-слово «монтаж») — светлый PDF
+    "montazh": {
+        "file_id": "BQACAgIAAyEGAATeHwufAAMYaiFH0u2R7RzSvJc8j5Nx8t_peboAArqbAAK02QlJLMqv5k9s-Q47BA",
+        "caption": (
+            "Держи <b>гайд по монтажу</b> вирусных видео 🎬\n\n"
+            "Внутри — инструменты и приёмы, чтобы собирать ролики "
+            "красиво и быстро.\n\n"
+            "Приятного просмотра 🚀"
+        ),
+    },
 }
 
 
