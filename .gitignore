@@ -8,3 +8,6 @@ __pycache__/
 # Локальные секреты
 .env
 *.env
+
+# GitHub Actions нельзя пушить нашим токеном (нет workflow scope)
+.github/

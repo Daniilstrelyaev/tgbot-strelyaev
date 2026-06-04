@@ -111,12 +111,41 @@ NOT_SUBSCRIBED_TEXT = (
     "и я сразу пришлю гайд 🤍"
 )
 
-# Текст-подпись к PDF-гайду (блок 1), формат HTML
+# Текст-подпись к PDF-гайду по умолчанию, формат HTML
 LEAD_MAGNET_CAPTION = (
     "Держи гайд по оплате нейросетей из РФ 🎬\n\n"
     "Внутри — <b>все сервисы, ссылки</b> и как платить без хаоса.\n\n"
     "Когда подготовишь доступы — переходи к следующему шагу 🚀"
 )
+
+# ── НЕСКОЛЬКО ГАЙДОВ ПОД РАЗНЫЕ КОДОВЫЕ СЛОВА (deep-link) ──────────────────────
+# Человек переходит по ссылке t.me/<бот>?start=<код> → бот выдаёт нужный гайд.
+# Чтобы добавить новый гайд:
+#   1) загрузи PDF:  python3 ~/.claude/skills/tgbot-ops/scripts/tg.py upload файл.pdf
+#   2) скопируй полученный file_id и добавь строку в LEAD_MAGNETS ниже
+#   3) задеплой:     python3 ~/.claude/skills/tgbot-ops/scripts/deploy.py "новый гайд X"
+# Код — латиницей/цифрами (например "ai", "reels"). Ссылка для Instagram-директа:
+#   https://t.me/Strelyae_v_D22293848494bot?start=<код>
+LEAD_MAGNETS: dict[str, dict[str, str]] = {
+    # default — текущий гайд. file_id берётся из LEAD_MAGNET_FILE_ID
+    # (или файл lead_magnet.pdf с диска, если file_id не задан).
+    "default": {"file_id": LEAD_MAGNET_FILE_ID, "caption": LEAD_MAGNET_CAPTION},
+    # Примеры — раскомментируй и подставь свой file_id, когда пришлёшь PDF:
+    # "reels": {"file_id": "BQAC...", "caption": "Держи гайд по Reels 🎬"},
+    # "ai":    {"file_id": "BQAC...", "caption": "Держи связки нейросетей 🤖"},
+}
+
+
+def _resolve_magnet(code: str) -> dict[str, str]:
+    """По коду из deep-link возвращает нужный гайд (или default)."""
+    return LEAD_MAGNETS.get(code) or LEAD_MAGNETS["default"]
+
+
+def _sanitize_code(payload: str) -> str:
+    """Чистит payload из /start или callback: латиница/цифры/_/-, нижний регистр, до 32 симв.
+    Пустой/неизвестный код превратится в 'default' уже на этапе выдачи."""
+    code = re.sub(r"[^A-Za-z0-9_-]", "", payload or "").lower()[:32]
+    return code or "default"
 
 MENU_TEXT = "Выбери, что нужно 👇"
 REVIEW_INTRO_TEXT = "Окей, погнали 🔥\nОтветь на 4 коротких вопроса."
@@ -141,18 +170,20 @@ REVIEW_QUESTIONS = [
 REVIEW_FIELDS = ["name", "niche", "profile", "contact"]
 
 # ── КЛАВИАТУРЫ (кнопки) ───────────────────────────────────────────────────────
-WELCOME_KEYBOARD = {
-    "inline_keyboard": [
-        [{"text": "✅ Я подписался", "callback_data": "check_sub"}],
+# Кнопка «Я подписался» несёт код гайда в callback_data: "check_sub:<код>".
+# Так после подтверждения подписки бот знает, какой именно гайд выдать.
+def kb_welcome(code: str = "default") -> dict:
+    return {"inline_keyboard": [
+        [{"text": "✅ Я подписался", "callback_data": f"check_sub:{code}"}],
         [{"text": "📣 Перейти на канал", "url": CHANNEL_URL}],
-    ]
-}
-NOT_SUBSCRIBED_KEYBOARD = {
-    "inline_keyboard": [
-        [{"text": "Готово ✅", "callback_data": "check_sub"}],
+    ]}
+
+
+def kb_not_subscribed(code: str = "default") -> dict:
+    return {"inline_keyboard": [
+        [{"text": "Готово ✅", "callback_data": f"check_sub:{code}"}],
         [{"text": "📣 Перейти на канал", "url": CHANNEL_URL}],
-    ]
-}
+    ]}
 MENU_KEYBOARD = {
     "inline_keyboard": [
         [{"text": "📥 Забрать гайд", "callback_data": "get_guide"}],
@@ -578,18 +609,20 @@ def send_photo(chat_id: int, photo: str, caption: str | None = None,
     return _send_with_retries("sendPhoto", payload=payload, log_label="sendPhoto", read_timeout=5.0)
 
 
-def send_document(chat_id: int, caption: str | None = None, parse_mode: str | None = None) -> SendResult:
-    """Отправляет PDF-гайд: по file_id (быстро) или загрузкой файла с диска."""
-    # Вариант 1 — по file_id (мгновенно, рекомендуется)
-    if LEAD_MAGNET_FILE_ID:
-        payload: dict[str, Any] = {"chat_id": chat_id, "document": LEAD_MAGNET_FILE_ID}
-        if caption:
-            payload["caption"] = caption
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
+def send_guide(chat_id: int, magnet: dict[str, str]) -> SendResult:
+    """Отправляет конкретный гайд: по file_id (быстро) или (для default) файлом с диска."""
+    caption = magnet.get("caption") or LEAD_MAGNET_CAPTION
+    file_id = magnet.get("file_id", "")
+
+    # Вариант 1 — по file_id (мгновенно)
+    if file_id:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id, "document": file_id,
+            "caption": caption, "parse_mode": "HTML",
+        }
         return _send_with_retries("sendDocument", payload=payload, log_label="sendDocument", read_timeout=10.0)
 
-    # Вариант 2 — загрузка файла с диска по пути LEAD_MAGNET_PATH
+    # Вариант 2 — загрузка файла с диска (только для default-гайда без file_id)
     if LEAD_MAGNET_PATH and os.path.exists(LEAD_MAGNET_PATH):
         try:
             with open(LEAD_MAGNET_PATH, "rb") as f:
@@ -597,31 +630,28 @@ def send_document(chat_id: int, caption: str | None = None, parse_mode: str | No
         except OSError as exc:
             log.error("не смог прочитать лид-магнит %s: %s", LEAD_MAGNET_PATH, exc)
             return SendResult.PERMANENT_FAILURE
-        filename = os.path.basename(LEAD_MAGNET_PATH)
         fields: dict[str, Any] = {
             "chat_id": str(chat_id),
-            "document": (filename, file_bytes, "application/pdf"),
+            "document": (os.path.basename(LEAD_MAGNET_PATH), file_bytes, "application/pdf"),
+            "caption": caption, "parse_mode": "HTML",
         }
-        if caption:
-            fields["caption"] = caption
-        if parse_mode:
-            fields["parse_mode"] = parse_mode
         return _send_with_retries("sendDocument", log_label="sendDocument",
                                   read_timeout=20.0, multipart_fields=fields)
 
-    log.error("лид-магнит не настроен (нет file_id и нет файла %s)", LEAD_MAGNET_PATH)
+    log.error("гайд не настроен (нет file_id и нет файла %s)", LEAD_MAGNET_PATH)
     return SendResult.PERMANENT_FAILURE
 
 
-def send_welcome(chat_id: int) -> SendResult:
+def send_welcome(chat_id: int, code: str = "default") -> SendResult:
+    keyboard = kb_welcome(code)
     if WELCOME_PHOTO_FILE_ID:
         result = send_photo(chat_id, WELCOME_PHOTO_FILE_ID, caption=WELCOME_TEXT,
-                            reply_markup=WELCOME_KEYBOARD, parse_mode="HTML")
+                            reply_markup=keyboard, parse_mode="HTML")
         if result is SendResult.PERMANENT_FAILURE:
             log.warning("sendPhoto failed permanently; fallback to text welcome")
-            return send_message(chat_id, WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD, parse_mode="HTML")
+            return send_message(chat_id, WELCOME_TEXT, reply_markup=keyboard, parse_mode="HTML")
         return result
-    return send_message(chat_id, WELCOME_TEXT, reply_markup=WELCOME_KEYBOARD, parse_mode="HTML")
+    return send_message(chat_id, WELCOME_TEXT, reply_markup=keyboard, parse_mode="HTML")
 
 
 def answer_callback_query(callback_id: str, text: str = "", show_alert: bool = False) -> bool:
@@ -666,8 +696,8 @@ def check_subscription(user_id: int) -> SubscriptionResult:
     return SubscriptionResult.UNKNOWN
 
 
-def _deliver_guide(user_id: int, callback_id: str | None = None) -> str:
-    """Проверяет подписку и выдаёт PDF-гайд. Возвращает строку-итог для логов."""
+def _deliver_guide(user_id: int, callback_id: str | None = None, code: str = "default") -> str:
+    """Проверяет подписку и выдаёт нужный гайд (по коду). Возвращает строку-итог для логов."""
     subscription = check_subscription(user_id)
 
     if subscription is SubscriptionResult.UNKNOWN:
@@ -680,13 +710,13 @@ def _deliver_guide(user_id: int, callback_id: str | None = None) -> str:
     if subscription is SubscriptionResult.SUBSCRIBED:
         if callback_id:
             answer_callback_query(callback_id, "Готово ✅")
-        send_document(user_id, caption=LEAD_MAGNET_CAPTION, parse_mode="HTML")
+        send_guide(user_id, _resolve_magnet(code))
         return "subscribed"
 
-    # не подписан
+    # не подписан — кнопка «Готово» сохраняет тот же код гайда
     if callback_id:
         answer_callback_query(callback_id, "Подписку пока не вижу", show_alert=True)
-    send_message(user_id, NOT_SUBSCRIBED_TEXT, reply_markup=NOT_SUBSCRIBED_KEYBOARD)
+    send_message(user_id, NOT_SUBSCRIBED_TEXT, reply_markup=kb_not_subscribed(code))
     return "not_subscribed"
 
 
@@ -818,13 +848,16 @@ def _handle_message(update: dict[str, Any], claimed_update_id: int | None) -> tu
     # ── Команды ──
     if cmd == "/start":
         _clear_fsm(user_id)
+        # deep-link: "/start <код>" — код определяет, какой гайд выдать потом
+        parts = text.strip().split(maxsplit=1)
+        code = _sanitize_code(parts[1]) if len(parts) > 1 else "default"
         if not _claim_chat_send(chat_id):
-            log.info("/start @%s (%s) -> throttled", username, chat_id)
+            log.info("/start @%s (%s) code=%s -> throttled", username, chat_id, code)
             return "ok", 200, _commit_if_claimed(claimed_update_id)
         chat_send_finalized = False
         try:
-            result = send_welcome(chat_id)
-            log.info("/start @%s (%s) -> %s", username, chat_id, result.value)
+            result = send_welcome(chat_id, code)
+            log.info("/start @%s (%s) code=%s -> %s", username, chat_id, code, result.value)
             if result is SendResult.RETRYABLE_FAILURE:
                 _release_chat_send(chat_id)
                 chat_send_finalized = True
@@ -906,7 +939,12 @@ def _handle_callback_query(callback_query: dict[str, Any], claimed_update_id: in
     if isinstance(maybe_username, str) and maybe_username:
         username = _safe_log_value(maybe_username)
 
-    if data not in {"check_sub", "get_guide", "want_review"}:
+    # callback_data может нести код гайда: "check_sub:<код>" / "get_guide:<код>"
+    data_str = data if isinstance(data, str) else ""
+    base, _, code_raw = data_str.partition(":")
+    code = _sanitize_code(code_raw)
+
+    if base not in {"check_sub", "get_guide", "want_review"}:
         answer_callback_query(callback_id)
         log.info("callback @%s (%s) -> ignored data=%s", username, user_id, _safe_log_value(data))
         return "ok", 200, _commit_if_claimed(claimed_update_id)
@@ -918,9 +956,9 @@ def _handle_callback_query(callback_query: dict[str, Any], claimed_update_id: in
 
     callback_finalized = False
     try:
-        if data in ("check_sub", "get_guide"):
-            outcome = _deliver_guide(user_id, callback_id)
-            log.info("callback @%s (%s) data=%s -> %s", username, user_id, data, outcome)
+        if base in ("check_sub", "get_guide"):
+            outcome = _deliver_guide(user_id, callback_id, code)
+            log.info("callback @%s (%s) base=%s code=%s -> %s", username, user_id, base, code, outcome)
             if outcome == "unknown":
                 _release_action(user_id)   # дадим повторить сразу
                 callback_finalized = True
@@ -929,7 +967,7 @@ def _handle_callback_query(callback_query: dict[str, Any], claimed_update_id: in
             callback_finalized = True
             return "ok", 200, _commit_if_claimed(claimed_update_id)
 
-        if data == "want_review":
+        if base == "want_review":
             answer_callback_query(callback_id)
             _clear_fsm(user_id)
             _start_review(user_id)
